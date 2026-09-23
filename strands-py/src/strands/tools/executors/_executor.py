@@ -5,7 +5,9 @@ thread pools, etc.).
 """
 
 import abc
+import asyncio
 import logging
+import sys
 import threading
 import time
 from collections.abc import AsyncGenerator, Callable
@@ -542,6 +544,27 @@ def _route_background(
     return tool_use, background_tasks.route_tool_call(tool_use, requested_tool, selected_tool)
 
 
+def _task_cancellation_requested(cancel_signal: threading.Event) -> bool:
+    """Return whether the task running a tool is being cancelled, rather than the tool raising CancelledError."""
+    task = asyncio.current_task()
+    if sys.version_info >= (3, 11) and task is not None:
+        return task.cancelling() > 0
+    # Without Task.cancelling() only an agent cancel identifies a CancelledError as the tool's own.
+    return not cancel_signal.is_set()
+
+
+def _cancelled_tool_result(tool_use: ToolUse, error: asyncio.CancelledError) -> ToolResult:
+    """Build the error result for a tool call that stopped with CancelledError; it is not retried."""
+    reason = str(error)
+    result = {
+        "toolUseId": str(tool_use.get("toolUseId")),
+        "status": "error",
+        "content": [{"text": f"Tool execution cancelled: {reason}" if reason else "Tool execution cancelled"}],
+        "cancelled": True,
+    }
+    return cast(ToolResult, result)
+
+
 def _with_tool_use_id(result: ToolResult, tool_use_id: str) -> ToolResult:
     """Return ``result`` carrying ``tool_use_id``, copying it only when a hook replaced the id."""
     if result.get("toolUseId") == tool_use_id:
@@ -647,6 +670,15 @@ def _make_execute_tool_terminal(
             # A tool-raised interrupt must halt the agent — let it unwind rather than
             # becoming an error result (matches TS re-throwing InterruptError).
             raise
+        except asyncio.CancelledError as error:
+            # A tool that stops because the agent was cancelled (e.g. the vended http_request and web_fetch
+            # tools) raises CancelledError while its task is not being cancelled: that is a cancelled result.
+            # Cancellation of the task that runs the tool propagates.
+            if _task_cancellation_requested(ctx.cancel_signal):
+                raise
+            logger.debug("tool_name=<%s> | tool execution cancelled", tool_use["name"])
+            yield ToolResultEvent(_cancelled_tool_result(tool_use, error))
+            return
         except Exception as error:
             # Convert a raw tool failure to an error result inside the terminal so middleware
             # sees a result, not an exception. The executor's after-hook still receives the

@@ -138,13 +138,10 @@ async def test_concurrent_executor_reraises_exceptions(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_executor_raises_base_exception_from_tool(
+async def test_concurrent_executor_records_result_of_tool_that_raises_cancelled_error(
     executor, agent, tool_results, cycle_trace, cycle_span, invocation_state, structured_output_context, alist
 ):
-    """A BaseException from a tool body ends the batch, as in the sequential executor.
-
-    It must not end its task silently and let the batch finish with no result for that tool use.
-    """
+    """A CancelledError raised by a tool body, not by cancelling its task, becomes a cancelled tool result."""
 
     @strands.tool(name="awaits_cancelled_future_tool")
     async def awaits_cancelled_future_tool():
@@ -161,6 +158,39 @@ async def test_concurrent_executor_raises_base_exception_from_tool(
     stream = executor._execute(
         agent, tool_uses, tool_results, cycle_trace, cycle_span, invocation_state, structured_output_context
     )
+    await alist(stream)
 
-    with pytest.raises(asyncio.CancelledError):
+    tru_results = [(result["toolUseId"], result["status"], result.get("cancelled")) for result in tool_results]
+    exp_results = [("1", "error", True), ("2", "success", None)]
+    assert tru_results == exp_results
+
+
+class _HaltTool(BaseException):
+    """A BaseException that is neither an Exception nor a cancellation."""
+
+
+@pytest.mark.asyncio
+async def test_concurrent_executor_raises_base_exception_from_tool(
+    executor, agent, tool_results, cycle_trace, cycle_span, invocation_state, structured_output_context, alist
+):
+    """A BaseException from a tool body ends the batch, as in the sequential executor.
+
+    It must not end its task silently and let the batch finish with no result for that tool use.
+    """
+
+    @strands.tool(name="halting_tool")
+    async def halting_tool():
+        raise _HaltTool()
+
+    agent.tool_registry.register_tool(halting_tool)
+    tool_uses = [
+        {"name": "halting_tool", "toolUseId": "1", "input": {}},
+        {"name": "weather_tool", "toolUseId": "2", "input": {}},
+    ]
+
+    stream = executor._execute(
+        agent, tool_uses, tool_results, cycle_trace, cycle_span, invocation_state, structured_output_context
+    )
+
+    with pytest.raises(_HaltTool):
         await alist(stream)

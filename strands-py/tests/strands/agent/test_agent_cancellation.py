@@ -5,11 +5,13 @@ import threading
 import time
 from unittest.mock import ANY
 
+import httpx
 import pytest
 
 from strands import Agent, tool
 from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent, BeforeToolCallEvent, BeforeToolsEvent
 from strands.tools.executors import SequentialToolExecutor
+from strands.vended_tools.http_request import make_http_request
 from tests.fixtures.mocked_model_provider import MockedModelProvider
 
 # Default agent response for simple tests
@@ -728,3 +730,68 @@ async def test_sequential_cancel_during_resumed_batch_records_one_result_per_too
     assert ran == ["first"]
     assert _tool_result_ids(agent) == ["t1", "t2"]
     assert [message["role"] for message in agent.messages] == ["user", "assistant", "user", "assistant"]
+
+
+def _http_cancel_agent(tool_executor=None):
+    """An agent whose model calls the vended http_request tool, then a plain tool; the request stalls mid-body."""
+    request_started = asyncio.Event()
+    release_body = asyncio.Event()
+
+    class StalledBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"part"
+            await release_body.wait()
+            yield b"rest"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        request_started.set()
+        return httpx.Response(200, stream=StalledBody())
+
+    @tool
+    def ok_tool() -> str:
+        """Return ok."""
+        return "ok"
+
+    tool_use_response = {
+        "role": "assistant",
+        "content": [
+            {
+                "toolUse": {
+                    "toolUseId": "t1",
+                    "name": "http_request",
+                    "input": {"method": "GET", "url": "http://x.test/"},
+                }
+            },
+            {"toolUse": {"toolUseId": "t2", "name": "ok_tool", "input": {}}},
+        ],
+    }
+    http_request = make_http_request(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    kwargs = {} if tool_executor is None else {"tool_executor": tool_executor}
+    agent = Agent(
+        model=MockedModelProvider([tool_use_response, DEFAULT_RESPONSE]),
+        tools=[http_request, ok_tool],
+        callback_handler=None,
+        **kwargs,
+    )
+
+    async def cancel_mid_request():
+        await request_started.wait()
+        agent.cancel()
+        release_body.set()
+
+    return agent, cancel_mid_request
+
+
+@pytest.mark.parametrize("tool_executor", [None, SequentialToolExecutor()], ids=["default", "sequential"])
+@pytest.mark.asyncio
+async def test_cancel_during_vended_http_request_returns_cancelled_with_one_result_per_tool_use(tool_executor):
+    """agent.cancel() during the vended http_request returns stop_reason "cancelled" and answers every tool use."""
+    agent, cancel_mid_request = _http_cancel_agent(tool_executor)
+    canceller = asyncio.create_task(cancel_mid_request())
+
+    result = await agent.invoke_async("fetch it")
+    await canceller
+
+    assert result.stop_reason == "cancelled"
+    assert _tool_result_ids(agent) == ["t1", "t2"]
+    assert agent.messages[2]["content"][0]["toolResult"]["status"] == "error"

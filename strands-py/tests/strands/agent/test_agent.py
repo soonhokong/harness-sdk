@@ -3837,9 +3837,8 @@ def _tool_result_ids_in(message):
 
 
 @pytest.mark.asyncio
-async def test_agent_concurrent_tool_base_exception_does_not_drop_tool_result():
-    """A tool whose body raises a BaseException must not leave its tool use without a result while the agent
-    carries on: the concurrent executor raises it, as the sequential executor does."""
+async def test_agent_concurrent_tool_cancelled_error_does_not_drop_tool_result():
+    """A tool whose body raises CancelledError gets a cancelled result; the agent answers every tool use."""
 
     @strands.tool
     async def awaits_cancelled_future() -> str:
@@ -3867,11 +3866,11 @@ async def test_agent_concurrent_tool_base_exception_does_not_drop_tool_result():
         callback_handler=None,
     )
 
-    with pytest.raises(asyncio.CancelledError):
-        await agent.invoke_async("go")
+    result = await agent.invoke_async("go")
 
-    # No tool-result message that omits t1 was appended.
-    assert all(_tool_result_ids_in(message) in ([], ["t1", "t2"]) for message in agent.messages)
+    assert result.stop_reason == "end_turn"
+    assert _tool_result_ids_in(agent.messages[2]) == ["t1", "t2"]
+    assert agent.messages[2]["content"][0]["toolResult"]["status"] == "error"
 
 
 @pytest.mark.asyncio
