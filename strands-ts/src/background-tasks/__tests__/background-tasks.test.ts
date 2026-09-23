@@ -538,4 +538,43 @@ describe('BackgroundTasks', () => {
     await restored.invoke('Continue.')
     expect(deliveries(restored)).toHaveLength(1)
   })
+
+  it('restores a snapshot taken during delivery without delivering again', async () => {
+    // Code that runs while the delivery is being appended must not see the delivered task still
+    // tracked, or a snapshot taken there delivers it a second time after restore.
+    const work = tool({
+      name: 'work',
+      description: 'Perform work.',
+      inputSchema: z.object({}),
+      callback: async () => 'done',
+    })
+    const model = new MockMessageModel()
+      .addTurn({
+        type: 'toolUseBlock',
+        name: 'work',
+        toolUseId: 'work-use',
+        input: { _background_execution: true },
+      })
+      .addTurn({ type: 'textBlock', text: 'Task admitted.' })
+      .addTurn({ type: 'textBlock', text: 'Result received.' })
+    const agent = new Agent({ model, tools: [work], backgroundTasks: {}, printer: false })
+    let snapshot: ReturnType<Agent['takeSnapshot']> | undefined
+    const snapshotter = (async (): Promise<void> => {
+      for (let turns = 0; turns < 1_000_000 && deliveries(agent).length === 0; turns++) await Promise.resolve()
+      snapshot = agent.takeSnapshot({ preset: 'session' })
+    })()
+
+    await agent.invoke('Run work.')
+    await snapshotter
+
+    const restored = new Agent({
+      model: new MockMessageModel().addTurn({ type: 'textBlock', text: 'Continued.' }),
+      tools: [],
+      backgroundTasks: {},
+      printer: false,
+    })
+    restored.loadSnapshot(snapshot!)
+    await restored.invoke('Continue.')
+    expect(deliveries(restored)).toHaveLength(1)
+  })
 })

@@ -330,11 +330,12 @@ export class BackgroundTasks implements Plugin {
         ]
       }),
       onAppended: async () => {
-        const liveTaskIds = new Set((await this._manager.list()).map((task) => task.taskId))
-        const managerTaskIds = taskIds.filter((taskId) => liveTaskIds.has(taskId))
-        await this._manager.remove(managerTaskIds)
+        // Forget the delivered tasks before the first await: the delivery is already in history, so
+        // code that runs at an await (e.g. takeSnapshot) must not find them still tracked.
         for (const taskId of taskIds) this._tasks.delete(taskId)
         this._persistTasks()
+        const liveTaskIds = new Set((await this._manager.list()).map((task) => task.taskId))
+        await this._manager.remove(taskIds.filter((taskId) => liveTaskIds.has(taskId)))
       },
     })
   }
