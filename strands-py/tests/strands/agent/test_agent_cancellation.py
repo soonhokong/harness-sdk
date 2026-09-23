@@ -15,6 +15,7 @@ from strands.hooks import (
     BeforeToolCallEvent,
     BeforeToolsEvent,
 )
+from strands.types.agent import ConcurrentInvocationMode
 from tests.fixtures.mocked_model_provider import MockedModelProvider
 
 # Default agent response for simple tests
@@ -657,8 +658,6 @@ class _GatedStreamModel(MockedModelProvider):
 
 
 def _reentrant_agent(names):
-    from strands.types.agent import ConcurrentInvocationMode
-
     gates = {name: asyncio.Event() for name in names}
     started = {name: asyncio.Event() for name in names}
     agent = Agent(
@@ -718,6 +717,72 @@ async def test_unsafe_reentrant_invocation_end_keeps_another_invocations_cancell
     result_b = await task_b
 
     assert result_b.stop_reason == "cancelled"
+
+
+async def _drain_in_step_tasks(stream):
+    """Consume a stream running each step in a fresh task, as a consumer racing events against a
+    disconnect or keepalive does (and asyncio.wait_for does on Python 3.10 and 3.11)."""
+    last = None
+    while True:
+        try:
+            last = await asyncio.ensure_future(stream.__anext__())
+        except StopAsyncIteration:
+            return last
+
+
+@pytest.mark.asyncio
+async def test_unsafe_reentrant_cancel_reaches_a_stream_stepped_in_separate_tasks():
+    """cancel() reaches an invocation whose stream steps each run in their own task."""
+    agent, gates, started = _reentrant_agent(["a"])
+
+    consumer = asyncio.create_task(_drain_in_step_tasks(agent.stream_async("a")))
+    await started["a"].wait()
+    agent.cancel()
+    gates["a"].set()
+    last = await consumer
+
+    assert last["result"].stop_reason == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_unsafe_reentrant_cancel_signal_reaches_a_stream_stepped_in_separate_tasks():
+    """A caller-owned cancel_signal reaches an invocation whose stream steps each run in their own task."""
+    agent, gates, started = _reentrant_agent(["a"])
+    signal = threading.Event()
+
+    consumer = asyncio.create_task(_drain_in_step_tasks(agent.stream_async("a", cancel_signal=signal)))
+    await started["a"].wait()
+    signal.set()
+    await asyncio.sleep(0.2)  # longer than the cancel_signal poll interval
+    gates["a"].set()
+    last = await consumer
+
+    assert last["result"].stop_reason == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_unsafe_reentrant_cancel_signal_isolated_between_streams_stepped_in_one_task():
+    """Two streams iterated alternately in one task each observe only their own cancel_signal."""
+    agent = Agent(
+        model=MockedModelProvider([DEFAULT_RESPONSE, DEFAULT_RESPONSE]),
+        callback_handler=None,
+        concurrent_invocation_mode=ConcurrentInvocationMode.UNSAFE_REENTRANT,
+    )
+    signal_b = threading.Event()
+    streams = {"a": agent.stream_async("a"), "b": agent.stream_async("b", cancel_signal=signal_b)}
+    last = {}
+    for name in ("a", "b"):
+        last[name] = await streams[name].__anext__()
+    signal_b.set()
+    while streams:
+        for name in list(streams):
+            try:
+                last[name] = await streams[name].__anext__()
+            except StopAsyncIteration:
+                del streams[name]
+
+    assert last["a"]["result"].stop_reason == "end_turn"
+    assert last["b"]["result"].stop_reason == "cancelled"
 
 
 @pytest.mark.asyncio

@@ -143,6 +143,20 @@ class _InvocationCancel:
     active: bool = True
 
 
+# Cancellation state of the invocation whose stream step is running, keyed by id(agent). Every step
+# of an UNSAFE_REENTRANT invocation binds it and resets it before yielding, so the binding holds in
+# whatever task runs the step and does not leak into the consumer's context.
+_INVOCATION_CANCELS: contextvars.ContextVar[Mapping[int, _InvocationCancel] | None] = contextvars.ContextVar(
+    "strands_invocation_cancels", default=None
+)
+
+
+def _reset_binding(token: "contextvars.Token[Mapping[int, _InvocationCancel] | None] | None") -> None:
+    """Reset a binding made by ``Agent._bind_invocation_cancel``."""
+    if token is not None:
+        _INVOCATION_CANCELS.reset(token)
+
+
 def _retrieve_exception(task: "asyncio.Task[None]") -> None:
     if not task.cancelled():
         task.exception()
@@ -474,9 +488,6 @@ class Agent(AgentBase, LocalAgent):
         self._pending_stream_close: asyncio.Task[None] | None = None
         # Caller-owned external cancel signal for the current invocation, if any (THROW mode).
         self._external_cancel_signal: threading.Event | None = None
-        self._invocation_cancel: contextvars.ContextVar[_InvocationCancel | None] = contextvars.ContextVar(
-            "strands_invocation_cancel", default=None
-        )
         self._running_invocation_cancels: set[_InvocationCancel] = set()
         self._running_invocation_cancels_lock = threading.Lock()
 
@@ -709,10 +720,21 @@ class Agent(AgentBase, LocalAgent):
     @property
     def _cancel_signal(self) -> threading.Event:
         """The signal cancellation checkpoints of the current invocation read."""
-        invocation_cancel = self._invocation_cancel.get()
-        if invocation_cancel is not None and invocation_cancel.active:
-            return invocation_cancel.signal
-        return self._agent_cancel_signal
+        invocation_cancel = self._current_invocation_cancel()
+        return invocation_cancel.signal if invocation_cancel is not None else self._agent_cancel_signal
+
+    def _current_invocation_cancel(self) -> _InvocationCancel | None:
+        bound = _INVOCATION_CANCELS.get()
+        invocation_cancel = bound.get(id(self)) if bound else None
+        return invocation_cancel if invocation_cancel is not None and invocation_cancel.active else None
+
+    def _bind_invocation_cancel(
+        self, invocation_cancel: _InvocationCancel | None
+    ) -> "contextvars.Token[Mapping[int, _InvocationCancel] | None] | None":
+        """Make ``invocation_cancel`` this agent's current cancel state in this context until reset."""
+        if invocation_cancel is None:
+            return None
+        return _INVOCATION_CANCELS.set({**(_INVOCATION_CANCELS.get() or {}), id(self): invocation_cancel})
 
     @property
     def cancel_signal(self) -> threading.Event:
@@ -1296,11 +1318,8 @@ class Agent(AgentBase, LocalAgent):
         Mirrors a linked external signal synchronously before reading, so a cancellation
         checkpoint never misses an external cancel that landed between watcher polls.
         """
-        invocation_cancel = self._invocation_cancel.get()
-        if invocation_cancel is not None and invocation_cancel.active:
-            external = invocation_cancel.external
-        else:
-            external = self._external_cancel_signal
+        invocation_cancel = self._current_invocation_cancel()
+        external = invocation_cancel.external if invocation_cancel is not None else self._external_cancel_signal
         if external is not None and external.is_set():
             self._cancel_signal.set()
         return self._cancel_signal.is_set()
@@ -1432,7 +1451,6 @@ class Agent(AgentBase, LocalAgent):
                 self._agent_cancel_signal.clear()
                 invocation_cancel.signal.set()
             self._running_invocation_cancels.add(invocation_cancel)
-        self._invocation_cancel.set(invocation_cancel)
         return invocation_cancel
 
     def _end_invocation_cancel(self, invocation_cancel: _InvocationCancel) -> None:
@@ -1491,6 +1509,8 @@ class Agent(AgentBase, LocalAgent):
         result: AgentResult | None = None
         cancel_watcher: asyncio.Task[None] | None = None
         invocation_cancel = self._begin_invocation_cancel(cancel_signal)
+        # Bound for the rest of this step, reset before each yield and rebound after it.
+        binding = self._bind_invocation_cancel(invocation_cancel)
 
         try:
             if invocation_cancel is None:
@@ -1545,7 +1565,10 @@ class Agent(AgentBase, LocalAgent):
                             if event.is_callback_event:
                                 as_dict = event.as_dict()
                                 callback_handler(**as_dict)
+                                _reset_binding(binding)
+                                binding = None
                                 yield as_dict
+                                binding = self._bind_invocation_cancel(invocation_cancel)
 
                         if stop_event is None:
                             raise RuntimeError(
@@ -1555,10 +1578,16 @@ class Agent(AgentBase, LocalAgent):
 
                         result = AgentResult(*stop_event["stop"])
                         callback_handler(result=result)
+                        _reset_binding(binding)
+                        binding = None
                         yield AgentResultEvent(result=result).as_dict()
+                        binding = self._bind_invocation_cancel(invocation_cancel)
 
                         self._end_agent_trace_span(response=result)
                     finally:
+                        # A close or throw arrives at a yield, where the binding is reset.
+                        if binding is None:
+                            binding = self._bind_invocation_cancel(invocation_cancel)
                         await events.aclose()
 
                 except Exception as e:
@@ -1589,6 +1618,7 @@ class Agent(AgentBase, LocalAgent):
             self._concurrency.complete(begin.registered, result=result)
             if self._concurrency.mode == ConcurrentInvocationMode.THROW:
                 self._concurrency.release_lock()
+            _reset_binding(binding)
 
     async def _run_loop(
         self,
