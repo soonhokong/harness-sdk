@@ -135,6 +135,37 @@ async def test_cancel_running_work_and_remove_before_execution_settles() -> None
 
 
 @pytest.mark.asyncio
+async def test_late_outcome_of_removed_task_is_dropped_without_loop_errors() -> None:
+    # A cancelled task can be delivered and removed before its execution returns. The late outcome
+    # must be dropped without an "Exception in callback" error from the event loop.
+    loop = asyncio.get_running_loop()
+    errors: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _, context: errors.append(context))
+    try:
+        finish, resolve = deferred()
+
+        async def execute(_: InProcessTaskExecutionContext) -> InProcessTaskExecutionOutcome:
+            return await finish
+
+        engine = create_engine(execute)
+        task = engine.submit(**create_admission("work"))
+        await asyncio.sleep(0)
+        engine.cancel(task["task_id"], reason="Stop work")
+        engine.remove(task["task_id"])
+
+        resolve({"status": "completed", "result": create_result("late")})
+        await engine.wait_for_idle()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    tru_errors = [str(context.get("exception")) for context in errors]
+    exp_errors: list[str] = []
+    assert tru_errors == exp_errors
+
+
+@pytest.mark.asyncio
 async def test_cancel_scheduled_work_without_executing_it() -> None:
     executed = False
 

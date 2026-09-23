@@ -200,7 +200,7 @@ class InProcessTaskEngine:
             task.add_done_callback(self._spawned_tasks.discard)
 
     async def _execute(self, task_id: str, active_execution: _ActiveExecution) -> None:
-        working = self._update_task(task_id, _mark_working)
+        working = self._update_live_task(task_id, _mark_working)
         if working is None:
             return
         if math.isfinite(self._timeout):
@@ -270,9 +270,9 @@ class InProcessTaskEngine:
 
     def _finish_outcome(self, task_id: str, outcome: InProcessTaskExecutionOutcome) -> None:
         if outcome["status"] == "input_required":
-            self._update_task(task_id, partial(_require_input, state=outcome["state"]))
+            self._update_live_task(task_id, partial(_require_input, state=outcome["state"]))
             return
-        self._update_task(task_id, partial(_finish_terminal_outcome, outcome=outcome))
+        self._update_live_task(task_id, partial(_finish_terminal_outcome, outcome=outcome))
 
     def _timeout_task(self, task_id: str, active_execution: _ActiveExecution) -> None:
         active_execution.timeout_handle = None
@@ -286,7 +286,7 @@ class InProcessTaskEngine:
             record["failure"] = {"type": "timeout", "message": reason}
             return True
 
-        task = self._update_task(task_id, time_out)
+        task = self._update_live_task(task_id, time_out)
         if task is not None:
             active_execution.cancel_signal.abort(reason)
 
@@ -304,6 +304,19 @@ class InProcessTaskEngine:
         self._tasks[task_id] = stored
         self._notify_task_updated(stored)
         return copy.deepcopy(stored)
+
+    def _update_live_task(
+        self,
+        task_id: str,
+        update: Callable[[InProcessTaskRecord], bool],
+    ) -> InProcessTaskRecord | None:
+        """Apply an execution or timer update; a record removed after reaching a terminal status is skipped.
+
+        Such an update could not commit anyway, and raising would surface as an event loop error.
+        """
+        if task_id not in self._tasks:
+            return None
+        return self._update_task(task_id, update)
 
     def _require_task(self, task_id: str) -> InProcessTaskRecord:
         task = self._tasks.get(task_id)
