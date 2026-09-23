@@ -8,7 +8,7 @@ import pytest
 
 from strands import Agent, tool
 from strands.agent._continuation import _ContinuationInput, add_input
-from strands.hooks import AfterInvocationEvent, BeforeModelCallEvent, MessageAddedEvent
+from strands.hooks import AfterInvocationEvent, BeforeInvocationEvent, BeforeModelCallEvent, MessageAddedEvent
 from strands.types.content import Message, MessageMetadata, Messages
 from strands.types.event_loop import StopReason, Usage
 from strands.types.tools import ToolContext
@@ -273,3 +273,50 @@ async def test_abandons_follow_up_input_when_stream_closes_before_it_is_appended
 
     abandoned.assert_called_once()
     assert [_text_of(message) for message in agent.messages] == ["start"]
+
+
+@pytest.mark.asyncio
+async def test_rejects_input_added_after_its_event_was_settled() -> None:
+    appended = Mock()
+    abandoned = Mock()
+    agent = Agent(model=_text_model("initial"), callback_handler=None)
+    captured: list[AfterInvocationEvent] = []
+    agent.hooks.add_callback(AfterInvocationEvent, captured.append)
+
+    await agent.invoke_async("start")
+
+    with pytest.raises(RuntimeError, match="already settled"):
+        add_input(captured[0], _ContinuationInput(args="late", on_appended=appended, on_abandoned=abandoned))
+    appended.assert_not_called()
+    abandoned.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rejects_input_added_after_its_event_was_prepared() -> None:
+    late_appended = Mock()
+    agent = Agent(model=_text_model("initial", "continued"), callback_handler=None)
+    prepared_events: list[AfterInvocationEvent] = []
+    late_errors: list[Exception] = []
+
+    def add_follow_up(event: AfterInvocationEvent) -> None:
+        if not prepared_events:
+            prepared_events.append(event)
+            add_input(event, _ContinuationInput(args="follow up"))
+
+    def add_late(event: BeforeInvocationEvent) -> None:
+        if prepared_events and not late_errors:
+            try:
+                add_input(prepared_events[0], _ContinuationInput(args="late", on_appended=late_appended))
+            except RuntimeError as error:
+                late_errors.append(error)
+
+    agent.hooks.add_callback(AfterInvocationEvent, add_follow_up)
+    agent.hooks.add_callback(BeforeInvocationEvent, add_late)
+
+    result = await agent.invoke_async("start")
+
+    assert result.stop_reason == "end_turn"
+    assert [_text_of(message) for message in agent.messages] == ["start", "initial", "follow up", "continued"]
+    late_appended.assert_not_called()
+    assert len(late_errors) == 1
+

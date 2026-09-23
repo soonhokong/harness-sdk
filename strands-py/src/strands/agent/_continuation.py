@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 _ContinuationEvent = AfterInvocationEvent | BeforeModelCallEvent
 _STATE_ATTRIBUTE = "_continuation_state"
+_SEALED_ATTRIBUTE = "_continuation_sealed"
 _DEFERRED_INPUTS_ATTRIBUTE = "_deferred_continuation_inputs"
 
 
@@ -51,7 +52,13 @@ def add_input(event: _ContinuationEvent, input_: _ContinuationInput) -> None:
     Args:
         event: Event that owns the continuation input.
         input_: Input and optional settlement callbacks to register.
+
+    Raises:
+        RuntimeError: If the event's inputs were already prepared or settled; nothing would ever
+            append or abandon the input.
     """
+    if getattr(event, _SEALED_ATTRIBUTE, False):
+        raise RuntimeError("continuation input added after the event's inputs were already settled")
     state = _get_state(event) or _ContinuationState()
     state.inputs.append(input_)
     _set_state(event, state)
@@ -182,6 +189,7 @@ def _set_state(event: _ContinuationEvent, state: _ContinuationState) -> None:
 def _consume_inputs(event: _ContinuationEvent) -> list[_ContinuationInput]:
     state = _get_state(event)
     _clear_state(event)
+    object.__setattr__(event, _SEALED_ATTRIBUTE, True)
     return state.inputs if state else []
 
 
