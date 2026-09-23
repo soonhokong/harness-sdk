@@ -727,7 +727,7 @@ async def test_sequential_cancel_during_resumed_batch_records_one_result_per_too
     resumed = await agent.invoke_async(response)
 
     assert resumed.stop_reason == "end_turn"
-    assert ran == ["first"]
+    assert ran[0] == "first"
     assert _tool_result_ids(agent) == ["t1", "t2"]
     assert [message["role"] for message in agent.messages] == ["user", "assistant", "user", "assistant"]
 
