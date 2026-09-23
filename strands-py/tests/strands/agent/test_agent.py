@@ -3871,3 +3871,66 @@ async def test_agent_concurrent_tool_base_exception_does_not_drop_tool_result():
 
     # No tool-result message that omits t1 was appended.
     assert all(_tool_result_ids_in(message) in ([], ["t1", "t2"]) for message in agent.messages)
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_results_follow_tool_use_order_with_invalid_tool_name():
+    """Tool results follow the order of the model's tool uses, including an invalid tool name."""
+
+    @strands.tool
+    def ok_tool() -> str:
+        """Return ok."""
+        return "ok"
+
+    tool_use_message = {
+        "role": "assistant",
+        "content": [
+            {"toolUse": {"toolUseId": "t1", "name": "ok_tool", "input": {}}},
+            {"toolUse": {"toolUseId": "t2", "name": "functions.ok_tool", "input": {}}},
+        ],
+    }
+    agent = Agent(
+        model=MockedModelProvider([tool_use_message, {"role": "assistant", "content": [{"text": "done"}]}]),
+        tools=[ok_tool],
+        callback_handler=None,
+    )
+
+    await agent.invoke_async("go")
+
+    assert _tool_result_ids_in(agent.messages[2]) == ["t1", "t2"]
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_results_follow_tool_use_order_after_interrupt_resume():
+    """Tool results follow the order of the model's tool uses when an interrupt splits the batch."""
+
+    @strands.tool(context=True)
+    def approver(tool_context: ToolContext) -> str:
+        """Require approval."""
+        tool_context.interrupt("approve")
+        return "approved"
+
+    @strands.tool
+    def ok_tool() -> str:
+        """Return ok."""
+        return "ok"
+
+    tool_use_message = {
+        "role": "assistant",
+        "content": [
+            {"toolUse": {"toolUseId": "t1", "name": "approver", "input": {}}},
+            {"toolUse": {"toolUseId": "t2", "name": "ok_tool", "input": {}}},
+        ],
+    }
+    agent = Agent(
+        model=MockedModelProvider([tool_use_message, {"role": "assistant", "content": [{"text": "done"}]}]),
+        tools=[approver, ok_tool],
+        callback_handler=None,
+    )
+
+    interrupted = await agent.invoke_async("go")
+    assert interrupted.stop_reason == "interrupt"
+    responses = [{"interruptResponse": {"interruptId": i.id, "response": "yes"}} for i in interrupted.interrupts]
+    await agent.invoke_async(responses)
+
+    assert _tool_result_ids_in(agent.messages[2]) == ["t1", "t2"]

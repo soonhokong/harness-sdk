@@ -799,6 +799,20 @@ async def _stop_for_interrupts(
         tracer.end_event_loop_cycle_span(span=cycle_span, message=message)
 
 
+def _in_tool_use_order(message: Message, tool_results: list[ToolResult]) -> list[ToolResult]:
+    """Order tool results by the tool uses of the assistant message that requested them.
+
+    Validation errors and results restored when resuming an interrupt are collected before the executor's results,
+    so collection order does not follow the request. Results whose id matches no tool use keep their relative order
+    at the end.
+    """
+    positions: dict[str, int] = {}
+    for content in message["content"]:
+        if "toolUse" in content:
+            positions.setdefault(content["toolUse"]["toolUseId"], len(positions))
+    return sorted(tool_results, key=lambda result: positions.get(result.get("toolUseId", ""), len(positions)))
+
+
 async def _handle_tool_execution(
     stop_reason: StopReason,
     message: Message,
@@ -917,7 +931,7 @@ async def _handle_tool_execution(
         # Always pair BeforeToolsEvent with AfterToolsEvent, even on cancel/interrupt/error paths.
         tool_result_message: Message = {
             "role": "user",
-            "content": [{"toolResult": result} for result in tool_results],
+            "content": [{"toolResult": result} for result in _in_tool_use_order(message, tool_results)],
         }
         after_tools_event = AfterToolsEvent(agent=agent, message=tool_result_message, invocation_state=invocation_state)
         try:
