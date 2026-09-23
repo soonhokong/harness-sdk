@@ -17,7 +17,6 @@ import type { Tool, ToolContext } from '../tools/tool.js'
 import { ToolStreamEvent } from '../tools/tool.js'
 import type { ToolUse } from '../tools/types.js'
 import type { Agent } from './agent.js'
-import { ConcurrentInvocationError } from '../errors.js'
 
 /**
  * Options for direct tool call execution.
@@ -78,6 +77,12 @@ export type ToolCallerProxy = Record<string, ToolHandle>
 export type AppendMessageFn = (message: Message, invocationState?: InvocationState) => Promise<void>
 
 /**
+ * Acquires the agent's invocation lock for a recorded direct tool call and returns its release
+ * function. Throws `ConcurrentInvocationError` if the lock is held.
+ */
+export type AcquireToolCallLockFn = () => () => void
+
+/**
  * Provides direct tool calling through the agent.
  *
  * Enables programmatic tool invocation without model inference via
@@ -107,6 +112,7 @@ export type AppendMessageFn = (message: Message, invocationState?: InvocationSta
 export class ToolCaller {
   private readonly _agent: Agent
   private readonly _appendMessage: AppendMessageFn
+  private readonly _acquireLock: AcquireToolCallLockFn
 
   /**
    * Creates a ToolCaller proxy for the given agent.
@@ -119,14 +125,17 @@ export class ToolCaller {
    * @param appendMessage - Helper provided by the agent to append messages and fire hooks.
    *   Passed in (rather than calling a public agent method) so message mutation stays
    *   encapsulated within the agent.
+   * @param acquireLock - Helper provided by the agent that holds its invocation lock during a
+   *   recorded call.
    */
-  static create(agent: Agent, appendMessage: AppendMessageFn): ToolCallerProxy {
-    return new ToolCaller(agent, appendMessage) as unknown as ToolCallerProxy
+  static create(agent: Agent, appendMessage: AppendMessageFn, acquireLock: AcquireToolCallLockFn): ToolCallerProxy {
+    return new ToolCaller(agent, appendMessage, acquireLock) as unknown as ToolCallerProxy
   }
 
-  private constructor(agent: Agent, appendMessage: AppendMessageFn) {
+  private constructor(agent: Agent, appendMessage: AppendMessageFn, acquireLock: AcquireToolCallLockFn) {
     this._agent = agent
     this._appendMessage = appendMessage
+    this._acquireLock = acquireLock
 
     // Return a Proxy that intercepts property access to resolve tool names
     return new Proxy(this, {
@@ -203,14 +212,21 @@ export class ToolCaller {
   ): AsyncGenerator<ToolStreamEvent, ToolResultBlock, undefined> {
     const shouldRecord = options?.recordDirectToolCall ?? true
 
-    // If recording, check that the agent is not currently invoking
-    if (shouldRecord && this._agent.isInvoking) {
-      throw new ConcurrentInvocationError(
-        'Direct tool call cannot be made while the agent is in the middle of an invocation. ' +
-          'Set recordDirectToolCall: false to allow direct tool calls during agent invocation.'
-      )
+    // A recorded call holds the invocation lock until its messages are recorded, so they cannot
+    // interleave with an invocation or with another recorded call.
+    const releaseLock = shouldRecord ? this._acquireLock() : undefined
+    try {
+      return yield* this._executeAndRecord(name, input, shouldRecord)
+    } finally {
+      releaseLock?.()
     }
+  }
 
+  private async *_executeAndRecord(
+    name: string,
+    input: JSONValue,
+    shouldRecord: boolean
+  ): AsyncGenerator<ToolStreamEvent, ToolResultBlock, undefined> {
     // Resolve the tool via the registry's normalization (exact → hyphen → case-insensitive)
     const tool = this._agent.toolRegistry.resolve(name)
 

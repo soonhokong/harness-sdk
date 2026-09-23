@@ -5,7 +5,7 @@ import { createMockTool } from '../../__fixtures__/tool-helpers.js'
 import { Message, ToolResultBlock, TextBlock, ToolUseBlock } from '../../types/messages.js'
 import { ConcurrentInvocationError, ToolNotFoundError } from '../../errors.js'
 import { ToolStreamEvent } from '../../tools/tool.js'
-import type { ToolContext } from '../../tools/tool.js'
+import type { Tool, ToolContext } from '../../tools/tool.js'
 import { anyTrackingId } from '../../__fixtures__/message-helpers.js'
 
 describe('ToolCaller', () => {
@@ -298,6 +298,60 @@ describe('ToolCaller', () => {
   })
 
   describe('concurrency protection', () => {
+    /** A tool that blocks until the returned `release` is called. */
+    function createGatedTool(name: string): { tool: Tool; started: Promise<void>; release: () => void } {
+      let release!: () => void
+      let markStarted!: () => void
+      const gate = new Promise<void>((resolve) => (release = resolve))
+      const started = new Promise<void>((resolve) => (markStarted = resolve))
+      const tool: Tool = {
+        name,
+        description: name,
+        toolSpec: { name, description: name, inputSchema: { type: 'object', properties: {} } },
+        // eslint-disable-next-line require-yield
+        async *stream(context: ToolContext): AsyncGenerator<never, ToolResultBlock, never> {
+          markStarted()
+          await gate
+          return new ToolResultBlock({
+            toolUseId: context.toolUse.toolUseId,
+            status: 'success',
+            content: [new TextBlock('done')],
+          })
+        },
+      }
+      return { tool, started, release }
+    }
+
+    it('rejects an invocation while a recorded direct tool call is running', async () => {
+      const gated = createGatedTool('gated_tool')
+      const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Hello' })
+      const agent = new Agent({ model, tools: [gated.tool], printer: false })
+
+      const toolCall = agent.tool.gated_tool!.invoke()
+      await gated.started
+
+      await expect(agent.invoke('Hi')).rejects.toThrow(ConcurrentInvocationError)
+
+      gated.release()
+      await toolCall
+      expect(agent.messages.map((message) => message.role)).toStrictEqual(['assistant', 'user', 'assistant'])
+    })
+
+    it('rejects a second recorded direct tool call while one is running', async () => {
+      const gated = createGatedTool('gated_tool')
+      const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Hello' })
+      const agent = new Agent({ model, tools: [gated.tool], printer: false })
+
+      const first = agent.tool.gated_tool!.invoke()
+      await gated.started
+      const second = agent.tool.gated_tool!.invoke()
+      gated.release()
+
+      await expect(second).rejects.toThrow(ConcurrentInvocationError)
+      await first
+      expect(agent.messages).toHaveLength(3)
+    })
+
     it('throws ConcurrentInvocationError when agent is invoking and recording is enabled', async () => {
       const tool = createMockTool(
         'slow-tool',
