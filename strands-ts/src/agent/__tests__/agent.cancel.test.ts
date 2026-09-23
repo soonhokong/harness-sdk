@@ -329,6 +329,28 @@ describe('Agent Cancellation', () => {
     })
   })
 
+  describe('cancel between passes', () => {
+    it('cancels the resumed pass when cancel() is called before it starts', async () => {
+      const model = new MockMessageModel()
+        .addTurn({ type: 'textBlock', text: 'first' })
+        .addTurn({ type: 'textBlock', text: 'second' })
+      const agent = new Agent({ model, printer: false })
+
+      let resumed = false
+      agent.addHook(AfterInvocationEvent, (event) => {
+        if (!resumed) {
+          resumed = true
+          agent.cancel()
+          event.resume = 'continue'
+        }
+      })
+
+      const result = await agent.invoke('Hi')
+      expect(result.stopReason).toBe('cancelled')
+      expect(agent.cancelSignal.aborted).toBe(false)
+    })
+  })
+
   describe('AfterInvocationEvent', () => {
     it('still fires when invocation is cancelled', async () => {
       const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Hello' })

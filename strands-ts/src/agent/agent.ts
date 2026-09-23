@@ -1187,13 +1187,14 @@ export class Agent implements LocalAgent, InvokableAgent {
 
       let currentArgs: InvokeArgs = args
 
-      while (true) {
-        // Fresh AbortController per iteration, composed with any external signal.
-        this._abortController = new AbortController()
-        this._abortSignal = resolvedOptions?.cancelSignal
-          ? AbortSignal.any([this._abortController.signal, resolvedOptions.cancelSignal])
-          : this._abortController.signal
+      // One AbortController per invocation, composed with any external signal, so a cancel() that
+      // lands between a pass and a resumed or continuation pass still cancels the invocation.
+      this._abortController = new AbortController()
+      this._abortSignal = resolvedOptions?.cancelSignal
+        ? AbortSignal.any([this._abortController.signal, resolvedOptions.cancelSignal])
+        : this._abortController.signal
 
+      while (true) {
         // Process interrupt responses before middleware runs so context.interrupt() can find them
         const interruptResponses = this._extractInterruptResponses(currentArgs)
         if (interruptResponses.length > 0) {
@@ -1291,6 +1292,9 @@ export class Agent implements LocalAgent, InvokableAgent {
         continuationEvent,
         new Error('Agent stream closed before continuation input was incorporated into agent history')
       )
+      // Reset so an idle agent reports a signal that is not aborted.
+      this._abortController = new AbortController()
+      this._abortSignal = this._abortController.signal
       this._isInvoking = false
     }
   }
@@ -1418,10 +1422,6 @@ export class Agent implements LocalAgent, InvokableAgent {
         }
         drainResult = await streamGenerator.next()
       }
-
-      // Reset controller and signal for next iteration / invocation
-      this._abortController = new AbortController()
-      this._abortSignal = this._abortController.signal
     }
 
     return iterationResult.value
