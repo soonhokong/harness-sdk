@@ -242,7 +242,16 @@ export class InProcessTaskEngine {
         },
       }
     }
-    this._finishOutcome(taskId, outcome)
+    try {
+      this._finishOutcome(taskId, outcome)
+    } catch (error) {
+      // An outcome the record cannot hold (e.g. a result structuredClone rejects) must still settle
+      // the task, or it stays 'working' with no execution left to finish it.
+      this._finishOutcome(taskId, {
+        status: 'failed',
+        failure: { type: 'executionError', message: getExecutionFailureMessage(error) },
+      })
+    }
   }
 
   private _finishOutcome(taskId: string, outcome: InProcessTaskExecutionOutcome): void {

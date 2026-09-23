@@ -461,4 +461,38 @@ describe('BackgroundTasks', () => {
     expect(response).toBe('yes')
     expect(deliveries(agent)).toHaveLength(2)
   })
+
+  it('settles work whose result cannot be copied', async () => {
+    // A one-key { json } result is passed through without a copy, so structuredClone of the task
+    // record rejects the function below. The task must still settle instead of staying 'working'.
+    let release!: () => void
+    const released = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const work = tool({
+      name: 'work',
+      description: 'Return an opaque handle.',
+      inputSchema: z.object({}),
+      callback: async () => {
+        await released
+        return { json: { handle: () => 1 } }
+      },
+    })
+    const model = new MockMessageModel()
+      .addTurn({
+        type: 'toolUseBlock',
+        name: 'work',
+        toolUseId: 'work-use',
+        input: { _background_execution: true },
+      })
+      .addTurn({ type: 'textBlock', text: 'Task admitted.' })
+      .addTurn({ type: 'textBlock', text: 'Result received.' })
+    const agent = new Agent({ model, tools: [work], backgroundTasks: { waitForCompletion: false }, printer: false })
+
+    await agent.invoke('Run work.')
+    release()
+    await expect.poll(() => persistedTasks(agent)?.map((task) => task.status), { timeout: 1_000 }).toEqual(['failed'])
+    await agent.invoke('Continue.')
+    expect(deliveries(agent)).toHaveLength(1)
+  })
 })
