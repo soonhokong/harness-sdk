@@ -406,13 +406,18 @@ class _BackgroundTasks(Plugin):
                 }
             )
 
-        async def on_appended() -> None:
+        async def remove_from_manager() -> None:
             live_task_ids = {task["task_id"] for task in await self._manager.list()}
             await self._manager.remove([task_id for task_id in task_ids if task_id in live_task_ids])
+
+        async def on_appended() -> None:
+            # Forget the delivered tasks before the first await: the delivery is already in history, so a
+            # snapshot or cancellation at an await must not find them still tracked for another delivery.
             with self._tasks_lock:
                 for task_id in task_ids:
                     self._tasks.pop(task_id, None)
             self._persist_tasks()
+            await asyncio.shield(remove_from_manager())
 
         _continuation.add_input(event, _continuation._ContinuationInput(args=messages, on_appended=on_appended))
 

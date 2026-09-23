@@ -819,6 +819,62 @@ async def test_persists_status_of_work_whose_result_is_not_json() -> None:
 
 
 @pytest.mark.asyncio
+async def test_snapshot_taken_during_delivery_restores_without_redelivery() -> None:
+    # A snapshot taken by concurrent code right after the delivery reaches the history must not
+    # also list the delivered task, or restoring it delivers the task a second time.
+    agent = _background_agent(work, responses=[_assistant_text("Task admitted."), _assistant_text("Result received.")])
+    snapshots = []
+
+    async def snapshot_once_delivered() -> None:
+        while not _deliveries(agent.messages):
+            await asyncio.sleep(0)
+        snapshots.append(agent.take_snapshot(preset="session"))
+
+    snapshotter = asyncio.create_task(snapshot_once_delivered())
+    await agent.invoke_async("Run work.")
+    await snapshotter
+
+    restored = Agent(
+        model=MockedModelProvider([_assistant_text("Continued.")]),
+        background_tasks={},
+        callback_handler=None,
+    )
+    restored.load_snapshot(snapshots[0])
+    await restored.invoke_async("Continue.")
+
+    tru_delivery_count = len(_deliveries(restored.messages))
+    exp_delivery_count = 1
+    assert tru_delivery_count == exp_delivery_count
+
+
+@pytest.mark.asyncio
+async def test_invocation_cancelled_during_delivery_does_not_redeliver() -> None:
+    # Cancelling the invocation right after the delivery reaches the history must not leave the
+    # delivered task tracked, or the next invocation delivers it a second time.
+    agent = _background_agent(
+        work,
+        responses=[
+            _assistant_text("Task admitted."),
+            _assistant_text("Result received."),
+            _assistant_text("Continued."),
+            _assistant_text("Continued."),
+        ],
+    )
+
+    invocation = asyncio.create_task(agent.invoke_async("Run work."))
+    while not _deliveries(agent.messages):
+        await asyncio.sleep(0)
+    invocation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invocation
+
+    await agent.invoke_async("Continue.")
+    tru_delivery_count = len(_deliveries(agent.messages))
+    exp_delivery_count = 1
+    assert tru_delivery_count == exp_delivery_count
+
+
+@pytest.mark.asyncio
 async def test_load_state_fails_restored_non_terminal_work() -> None:
     created_at = "2026-08-27T12:00:00Z"
     source = Agent(model=MockedModelProvider([]), callback_handler=None)
