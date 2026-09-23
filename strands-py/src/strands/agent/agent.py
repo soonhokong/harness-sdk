@@ -10,13 +10,14 @@ The Agent interface supports two complementary interaction patterns:
 """
 
 import asyncio
+import contextvars
 import copy
 import logging
 import threading
 import uuid
 import warnings
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -131,6 +132,15 @@ async def _link_cancel_signal(external: threading.Event, internal: threading.Eve
         await asyncio.sleep(_CANCEL_POLL_INTERVAL)
 
     internal.set()
+
+
+@dataclass(eq=False)
+class _InvocationCancel:
+    """Cancellation state of one invocation when invocations of an agent may overlap."""
+
+    signal: threading.Event = field(default_factory=threading.Event)
+    external: threading.Event | None = None
+    active: bool = True
 
 
 def _retrieve_exception(task: "asyncio.Task[None]") -> None:
@@ -457,11 +467,18 @@ class Agent(AgentBase, LocalAgent):
         self.record_direct_tool_call = record_direct_tool_call
         self.load_tools_from_directory = load_tools_from_directory
 
-        # Create internal cancel signal for graceful cancellation using threading.Event
-        self._cancel_signal = threading.Event()
+        # Internal cancel signal for graceful cancellation. In UNSAFE_REENTRANT mode each running
+        # invocation has its own signal (see _cancel_signal); this one then only carries a cancel()
+        # made while no invocation runs.
+        self._agent_cancel_signal = threading.Event()
         self._pending_stream_close: asyncio.Task[None] | None = None
-        # Caller-owned external cancel signal for the current invocation, if any.
+        # Caller-owned external cancel signal for the current invocation, if any (THROW mode).
         self._external_cancel_signal: threading.Event | None = None
+        self._invocation_cancel: contextvars.ContextVar[_InvocationCancel | None] = contextvars.ContextVar(
+            "strands_invocation_cancel", default=None
+        )
+        self._running_invocation_cancels: set[_InvocationCancel] = set()
+        self._running_invocation_cancels_lock = threading.Lock()
 
         self.tool_registry = ToolRegistry()
 
@@ -682,7 +699,20 @@ class Agent(AgentBase, LocalAgent):
         Note:
             Multiple calls to cancel() are safe and idempotent.
         """
-        self._cancel_signal.set()
+        with self._running_invocation_cancels_lock:
+            running = list(self._running_invocation_cancels)
+        if not running:
+            self._agent_cancel_signal.set()
+        for invocation_cancel in running:
+            invocation_cancel.signal.set()
+
+    @property
+    def _cancel_signal(self) -> threading.Event:
+        """The signal cancellation checkpoints of the current invocation read."""
+        invocation_cancel = self._invocation_cancel.get()
+        if invocation_cancel is not None and invocation_cancel.active:
+            return invocation_cancel.signal
+        return self._agent_cancel_signal
 
     @property
     def cancel_signal(self) -> threading.Event:
@@ -1266,7 +1296,11 @@ class Agent(AgentBase, LocalAgent):
         Mirrors a linked external signal synchronously before reading, so a cancellation
         checkpoint never misses an external cancel that landed between watcher polls.
         """
-        external = self._external_cancel_signal
+        invocation_cancel = self._invocation_cancel.get()
+        if invocation_cancel is not None and invocation_cancel.active:
+            external = invocation_cancel.external
+        else:
+            external = self._external_cancel_signal
         if external is not None and external.is_set():
             self._cancel_signal.set()
         return self._cancel_signal.is_set()
@@ -1382,6 +1416,30 @@ class Agent(AgentBase, LocalAgent):
             ),
         )
 
+    def _begin_invocation_cancel(self, cancel_signal: threading.Event | None) -> _InvocationCancel | None:
+        """Give an UNSAFE_REENTRANT invocation its own cancel signal; None in THROW mode.
+
+        Overlapping invocations would otherwise share one signal and one external-signal slot: a
+        caller's cancel_signal would cancel every running invocation, and the first to finish would
+        clear a cancellation meant for another.
+        """
+        if self._concurrency.mode != ConcurrentInvocationMode.UNSAFE_REENTRANT:
+            return None
+        invocation_cancel = _InvocationCancel(external=cancel_signal)
+        with self._running_invocation_cancels_lock:
+            if self._agent_cancel_signal.is_set():
+                # A cancel() made while no invocation ran cancels the next one.
+                self._agent_cancel_signal.clear()
+                invocation_cancel.signal.set()
+            self._running_invocation_cancels.add(invocation_cancel)
+        self._invocation_cancel.set(invocation_cancel)
+        return invocation_cancel
+
+    def _end_invocation_cancel(self, invocation_cancel: _InvocationCancel) -> None:
+        invocation_cancel.active = False
+        with self._running_invocation_cancels_lock:
+            self._running_invocation_cancels.discard(invocation_cancel)
+
     async def _await_pending_stream_close(self) -> None:
         """Wait for a stream the consumer dropped unfinished on this loop to finish closing."""
         pending = self._pending_stream_close
@@ -1432,9 +1490,11 @@ class Agent(AgentBase, LocalAgent):
 
         result: AgentResult | None = None
         cancel_watcher: asyncio.Task[None] | None = None
+        invocation_cancel = self._begin_invocation_cancel(cancel_signal)
 
         try:
-            self._external_cancel_signal = cancel_signal
+            if invocation_cancel is None:
+                self._external_cancel_signal = cancel_signal
             cancel_watcher = self._start_cancel_watcher(cancel_signal)
 
             self._interrupt_state.resume(prompt)
@@ -1519,10 +1579,12 @@ class Agent(AgentBase, LocalAgent):
                 # cancel() is enough: a cancelled task never resumes into internal.set(). Awaiting
                 # here would let a second cancellation skip the cleanup below and wedge the agent.
                 cancel_watcher.cancel()
-            self._external_cancel_signal = None
-
-            # Clear cancel signal to allow agent reuse after cancellation
-            self._cancel_signal.clear()
+            if invocation_cancel is not None:
+                self._end_invocation_cancel(invocation_cancel)
+            else:
+                self._external_cancel_signal = None
+                # Clear cancel signal to allow agent reuse after cancellation
+                self._cancel_signal.clear()
 
             self._concurrency.complete(begin.registered, result=result)
             if self._concurrency.mode == ConcurrentInvocationMode.THROW:

@@ -8,7 +8,13 @@ from unittest.mock import ANY
 import pytest
 
 from strands import Agent, tool
-from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent, BeforeToolCallEvent, BeforeToolsEvent
+from strands.hooks import (
+    AfterInvocationEvent,
+    AfterModelCallEvent,
+    BeforeModelCallEvent,
+    BeforeToolCallEvent,
+    BeforeToolsEvent,
+)
 from tests.fixtures.mocked_model_provider import MockedModelProvider
 
 # Default agent response for simple tests
@@ -630,6 +636,88 @@ async def test_cancel_while_tool_runs_does_not_re_execute_the_tool():
     agent._cancel_signal.clear()
     await agent.invoke_async(response)
     assert ran == ["executed"]
+
+
+class _GatedStreamModel(MockedModelProvider):
+    """Streams one text response per call; each call pauses mid-stream until its gate opens."""
+
+    def __init__(self, gates: dict[str, asyncio.Event], started: dict[str, asyncio.Event]):
+        super().__init__([DEFAULT_RESPONSE])
+        self.gates = gates
+        self.started = started
+
+    async def stream(self, messages, *args, **kwargs):
+        name = messages[-1]["content"][0]["text"]
+        events = self.map_agent_message_to_events(DEFAULT_RESPONSE)
+        yield next(events)
+        self.started[name].set()
+        await self.gates[name].wait()
+        for event in events:
+            yield event
+
+
+def _reentrant_agent(names):
+    from strands.types.agent import ConcurrentInvocationMode
+
+    gates = {name: asyncio.Event() for name in names}
+    started = {name: asyncio.Event() for name in names}
+    agent = Agent(
+        model=_GatedStreamModel(gates, started),
+        callback_handler=None,
+        concurrent_invocation_mode=ConcurrentInvocationMode.UNSAFE_REENTRANT,
+    )
+    return agent, gates, started
+
+
+@pytest.mark.asyncio
+async def test_unsafe_reentrant_cancel_signal_cancels_only_its_invocation():
+    """A caller-owned cancel_signal cancels the invocation it was passed to, not a concurrent one."""
+    agent, gates, started = _reentrant_agent(["a", "b"])
+    signal_b = threading.Event()
+
+    task_a = asyncio.create_task(agent.invoke_async("a"))
+    task_b = asyncio.create_task(agent.invoke_async("b", cancel_signal=signal_b))
+    await asyncio.gather(started["a"].wait(), started["b"].wait())
+
+    signal_b.set()
+    await asyncio.sleep(0.2)  # longer than the cancel_signal poll interval
+    gates["a"].set()
+    result_a = await task_a
+    gates["b"].set()
+    await task_b
+
+    assert result_a.stop_reason == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_unsafe_reentrant_invocation_end_keeps_another_invocations_cancellation():
+    """One invocation ending does not clear a cancellation pending for a concurrent invocation."""
+    agent, gates, started = _reentrant_agent(["a", "b"])
+    gates["a"].set()
+    a_after_invocation = asyncio.Event()
+    a_may_finish = asyncio.Event()
+
+    async def hold_a(event: AfterInvocationEvent) -> None:
+        if event.invocation_state.get("name") == "a":
+            a_after_invocation.set()
+            await a_may_finish.wait()
+
+    agent.hooks.add_callback(AfterInvocationEvent, hold_a)
+    signal_b = threading.Event()
+
+    task_a = asyncio.create_task(agent.invoke_async("a", invocation_state={"name": "a"}))
+    await a_after_invocation.wait()  # A is past its last cancellation checkpoint
+    task_b = asyncio.create_task(agent.invoke_async("b", cancel_signal=signal_b))
+    await started["b"].wait()
+
+    signal_b.set()
+    await asyncio.sleep(0.2)  # longer than the cancel_signal poll interval
+    a_may_finish.set()
+    await task_a
+    gates["b"].set()
+    result_b = await task_b
+
+    assert result_b.stop_reason == "cancelled"
 
 
 @pytest.mark.asyncio
