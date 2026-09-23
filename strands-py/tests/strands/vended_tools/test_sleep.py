@@ -15,8 +15,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from strands import Agent
+from strands.tools.executors import ConcurrentToolExecutor, SequentialToolExecutor
 from strands.vended_tools.sleep import make_sleep, sleep
 from strands.vended_tools.sleep.types import DEFAULT_MAX_DURATION
+from tests.fixtures.mocked_model_provider import MockedModelProvider
 
 # The parent package rebinds ``sleep`` to the tool object, which shadows the
 # submodule attribute. On Python 3.10 ``unittest.mock.patch`` walks a dotted
@@ -126,6 +129,42 @@ class TestCooperativeCancellation:
         elapsed = loop.time() - started
         # A cooperative cancel should return well under a second; the requested
         # sleep was 5 s.
+        assert elapsed < 1.0
+
+
+class TestAgentCancellation:
+    """agent.cancel() ends an in-flight sleep and the agent answers the tool use."""
+
+    @pytest.mark.parametrize("tool_executor", [ConcurrentToolExecutor(), SequentialToolExecutor()])
+    @pytest.mark.asyncio
+    async def test_agent_cancel_ends_sleep_with_cancelled_result(self, tool_executor):
+        capped = make_sleep(max_duration=10)
+        tool_use_message = {
+            "role": "assistant",
+            "content": [{"toolUse": {"toolUseId": "t1", "name": "sleep", "input": {"duration": 5}}}],
+        }
+        agent = Agent(
+            model=MockedModelProvider([tool_use_message, {"role": "assistant", "content": [{"text": "done"}]}]),
+            tools=[capped],
+            tool_executor=tool_executor,
+            callback_handler=None,
+        )
+
+        async def cancel_soon():
+            await asyncio.sleep(0.1)
+            agent.cancel()
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        canceller = asyncio.create_task(cancel_soon())
+        result = await agent.invoke_async("wait")
+        await canceller
+        elapsed = loop.time() - started
+
+        assert result.stop_reason == "cancelled"
+        tool_result = agent.messages[2]["content"][0]["toolResult"]
+        assert (tool_result["toolUseId"], tool_result["status"]) == ("t1", "error")
+        # The requested sleep was 5 s.
         assert elapsed < 1.0
 
 
