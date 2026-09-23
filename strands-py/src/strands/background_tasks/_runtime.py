@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import threading
 from collections.abc import Awaitable, Callable
@@ -27,6 +28,10 @@ class _BackgroundTaskRuntime:
             return await self._invoke(operation)
         future = asyncio.run_coroutine_threadsafe(self._invoke(operation), loop)
         return await asyncio.wrap_future(future)
+
+    def submit(self, operation: Callable[[], _T | Awaitable[_T]]) -> concurrent.futures.Future[_T]:
+        """Schedule an operation on the persistent loop; it runs even if the caller or its loop goes away."""
+        return asyncio.run_coroutine_threadsafe(self._invoke(operation), self._ensure_started())
 
     def _ensure_started(self) -> asyncio.AbstractEventLoop:
         existing_loop = self._loop

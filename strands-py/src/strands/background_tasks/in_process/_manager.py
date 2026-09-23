@@ -252,17 +252,38 @@ class InProcessTaskManager:
                     raise RuntimeError(
                         f"Background task '{task_id}' cannot be removed before reaching a terminal status"
                     )
-            for task_id in unique_task_ids:
-                self._engine.remove(task_id)
-                self._task_events.pop(task_id, None)
-            removed = set(unique_task_ids)
-            self._task_id_by_submission = {
-                key: task_id for key, task_id in self._task_id_by_submission.items() if task_id not in removed
-            }
-            if not self._task_id_by_submission:
-                self._has_tasks.clear()
+            self._remove_tracked(unique_task_ids)
 
         await self._runtime.run(remove)
+
+    def discard(self, task_ids: Sequence[str]) -> concurrent.futures.Future[None]:
+        """Stop tracking the given terminal tasks, ignoring ids that are no longer tracked.
+
+        The removal runs on the background runtime loop, so it completes even when the caller is
+        cancelled or its event loop shuts down.
+        """
+
+        def discard() -> None:
+            self._remove_tracked(
+                [
+                    task_id
+                    for task_id in dict.fromkeys(task_ids)
+                    if (record := self._engine.get(task_id)) is not None and is_task_status_terminal(record["status"])
+                ]
+            )
+
+        return self._runtime.submit(discard)
+
+    def _remove_tracked(self, task_ids: Sequence[str]) -> None:
+        for task_id in task_ids:
+            self._engine.remove(task_id)
+            self._task_events.pop(task_id, None)
+        removed = set(task_ids)
+        self._task_id_by_submission = {
+            key: task_id for key, task_id in self._task_id_by_submission.items() if task_id not in removed
+        }
+        if not self._task_id_by_submission:
+            self._has_tasks.clear()
 
     async def _execute_tool_task(self, context: InProcessTaskExecutionContext) -> InProcessTaskExecutionOutcome:
         execution = self._executions.get(context.invocation_state_id)

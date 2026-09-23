@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 from collections.abc import AsyncGenerator
@@ -926,6 +927,46 @@ async def test_invocation_cancelled_during_delivery_does_not_redeliver() -> None
         await invocation
 
     await agent.invoke_async("Continue.")
+    tru_delivery_count = len(_deliveries(agent.messages))
+    exp_delivery_count = 1
+    assert tru_delivery_count == exp_delivery_count
+
+
+def test_cancelled_delivery_releases_tasks_when_its_event_loop_shuts_down() -> None:
+    # The invocation is cancelled right after its delivery reaches the history and its event loop
+    # then shuts down. The delivered task must still be released, or load_snapshot stays refused.
+    agent = _background_agent(
+        work,
+        responses=[
+            _assistant_text("Task admitted."),
+            _assistant_text("Result received."),
+            _assistant_text("Continued."),
+            _assistant_text("Continued."),
+        ],
+    )
+
+    async def cancel_during_delivery() -> None:
+        invocation = asyncio.create_task(agent.invoke_async("Run work."))
+        while not _deliveries(agent.messages):
+            await asyncio.sleep(0)
+        invocation.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await invocation
+        # Returning now makes asyncio.run() cancel every task still on the loop.
+
+    asyncio.run(cancel_during_delivery())
+
+    snapshot = agent.take_snapshot(include=["state"])
+    deadline = time.monotonic() + 1
+    while True:
+        try:
+            agent.load_snapshot(snapshot)
+            break
+        except RuntimeError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.01)
+    asyncio.run(agent.invoke_async("Continue."))
     tru_delivery_count = len(_deliveries(agent.messages))
     exp_delivery_count = 1
     assert tru_delivery_count == exp_delivery_count
