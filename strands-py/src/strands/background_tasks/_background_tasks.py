@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import dataclasses
 import json
@@ -24,7 +25,6 @@ from ..tools.decorator import tool
 from ..tools.executors._executor import _lookup_tool
 from ..types.agent import LocalAgent
 from ..types.content import Messages
-from ..types.session import decode_bytes_values, encode_bytes_values
 from ..types.tools import AgentTool, ToolContext, ToolResult, ToolResultContent, ToolSpec, ToolUse
 from ._errors import BackgroundTaskNotFoundError
 from ._types import BackgroundTask, BackgroundTasksConfig, is_task_status_terminal
@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 
 _BACKGROUND_TASKS_STATE_KEY = "strands.background_tasks"
 _BACKGROUND_PROPERTY = "_background_execution"
+# Persisted bytes use a plugin-owned key: the session layer decodes its own "__bytes_encoded__" markers
+# across the whole agent before rebuilding agent state, which rejects bytes.
+_PERSISTED_BYTES_KEY = "__strands_background_task_bytes__"
 _MANAGE_TOOL_NAME = "strands_manage_background_task"
 _COMPOSITE_SCHEMA_KEYS = {"$ref", "allOf", "anyOf", "oneOf", "not", "if", "then", "else"}
 _FOREGROUND_TOOL_NAMES = {
@@ -247,7 +250,7 @@ class _BackgroundTasks(Plugin):
         Persisted work cannot resume in a new process, so non-terminal tasks are recorded as
         failed and their interrupts are dropped from the agent's interrupt state.
         """
-        stored: list[BackgroundTask] = decode_bytes_values(self._agent.state.get(_BACKGROUND_TASKS_STATE_KEY) or [])
+        stored: list[BackgroundTask] = _decode_persisted_bytes(self._agent.state.get(_BACKGROUND_TASKS_STATE_KEY) or [])
         recovered_interrupt_ids: set[str] = set()
         tasks: dict[str, BackgroundTask] = {}
         for task in stored:
@@ -522,14 +525,37 @@ def _tool_error(tool_use: ToolUse, message: str) -> ToolResult:
     return {"toolUseId": tool_use["toolUseId"], "status": "error", "content": [{"text": message}]}
 
 
+def _encode_persisted_bytes(value: Any) -> Any:
+    """Base64-encode bytes under the plugin-owned key, which only ``_decode_persisted_bytes`` reads."""
+    if isinstance(value, bytes):
+        return {_PERSISTED_BYTES_KEY: base64.b64encode(value).decode()}
+    if isinstance(value, dict):
+        return {key: _encode_persisted_bytes(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_encode_persisted_bytes(item) for item in value]
+    return value
+
+
+def _decode_persisted_bytes(value: Any) -> Any:
+    """Invert ``_encode_persisted_bytes``."""
+    if isinstance(value, dict):
+        if value.keys() == {_PERSISTED_BYTES_KEY} and isinstance(value[_PERSISTED_BYTES_KEY], str):
+            return base64.b64decode(value[_PERSISTED_BYTES_KEY])
+        return {key: _decode_persisted_bytes(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_persisted_bytes(item) for item in value]
+    return value
+
+
 def _persistable_task(task: BackgroundTask) -> Any:
     """Return a JSON-safe copy of a task snapshot for agent state.
 
     Agent state accepts only JSON, and one rejected snapshot would fail the whole write. Bytes (image,
-    document, or video content) are base64-encoded and decoded again by ``load_state``; any other value
-    JSON cannot hold drops that task's result and interrupt reasons, keeping its status and error.
+    document, or video content) are base64-encoded under a plugin-owned key and decoded again by
+    ``load_state``; any other value JSON cannot hold drops that task's result and interrupt reasons,
+    keeping its status and error.
     """
-    encoded = encode_bytes_values(task)
+    encoded = _encode_persisted_bytes(task)
     try:
         json.dumps(encoded)
         return encoded

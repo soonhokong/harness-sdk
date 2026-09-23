@@ -13,6 +13,8 @@ from strands import Agent, ToolContext, tool
 from strands._middleware.stages import ExecuteToolStage, InvokeModelStage
 from strands.hooks import AfterToolCallEvent, AgentInitializedEvent, BeforeToolCallEvent, MessageAddedEvent
 from strands.interrupt import Interrupt
+from strands.session import FileSessionManager, SnapshotSessionManager
+from strands.storage import LocalFileStorage
 from strands.tools.tools import PythonAgentTool
 from strands.types._events import ToolResultEvent
 from strands.types.content import Messages
@@ -816,6 +818,61 @@ async def test_persists_status_of_work_whose_result_is_not_json() -> None:
     assert persisted is not None
     assert persisted["status"] == "completed"
     assert "result" not in persisted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manager_kind", ["file", "snapshot"])
+async def test_restores_work_holding_bytes_through_a_session_manager(tmp_path: Any, manager_kind: str) -> None:
+    # Session managers decode their own bytes markers across the whole agent and then rebuild agent
+    # state, which rejects bytes. A completed task holding bytes must survive that round trip.
+    released = asyncio.Event()
+    content = [{"image": {"format": "png", "source": {"bytes": b"\x89PNG"}}}]
+
+    @tool(name="shot")
+    async def shot() -> dict[str, Any]:
+        """Take a screenshot."""
+        await released.wait()
+        return {"status": "success", "content": content}
+
+    def session_manager() -> Any:
+        if manager_kind == "file":
+            return FileSessionManager(session_id="background", storage_dir=str(tmp_path))
+        return SnapshotSessionManager(session_id="background", storage=LocalFileStorage(str(tmp_path)))
+
+    source_manager = session_manager()
+    agent = Agent(
+        model=MockedModelProvider(
+            [
+                _assistant_tool_use("shot", "shot-use", {"_background_execution": True}),
+                _assistant_text("Task admitted."),
+            ]
+        ),
+        tools=[shot],
+        session_manager=source_manager,
+        background_tasks={"wait_for_completion": False},
+        callback_handler=None,
+    )
+
+    await agent.invoke_async("Take a screenshot.")
+    released.set()
+    await asyncio.wait_for(_wait_for_listed_status(agent, "completed"), timeout=1)
+    # A session write while the completed task is still tracked, as happens before a crash.
+    if manager_kind == "file":
+        source_manager.sync_agent(agent)
+    else:
+        await source_manager.save_snapshot(agent, is_latest=True)
+
+    restored = Agent(
+        model=MockedModelProvider([_assistant_text("Result received.")]),
+        session_manager=session_manager(),
+        background_tasks={},
+        callback_handler=None,
+    )
+    await restored.invoke_async("Continue.")
+
+    delivered = _delivered_result(restored)
+    assert delivered["content"][0]["json"]["status"] == "completed"
+    assert delivered["content"][1:] == content
 
 
 @pytest.mark.asyncio
