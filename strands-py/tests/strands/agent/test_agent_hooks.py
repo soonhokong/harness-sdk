@@ -17,7 +17,7 @@ from strands.hooks import (
 )
 from strands.interrupt import Interrupt, InterruptException
 from strands.types.content import Messages
-from strands.types.exceptions import ModelThrottledException
+from strands.types.exceptions import EventLoopException, ModelThrottledException
 from strands.types.tools import ToolResult, ToolUse
 from tests.fixtures.mock_hook_provider import MockHookProvider
 from tests.fixtures.mocked_model_provider import MockedModelProvider
@@ -1250,3 +1250,36 @@ def test_replaced_tool_use_id_does_not_rerun_completed_tool_on_interrupt_resume(
 
     assert runs == ["ran"]
     assert sorted(_tool_result_ids(agent)) == ["t1", "t2"]
+
+
+def test_after_tool_call_hooks_run_once_when_a_hook_reraises_the_tool_exception():
+    """The documented re-raise pattern must not make the AfterToolCallEvent hooks run twice for one call."""
+
+    @strands.tool
+    def failing_tool() -> str:
+        """Fail."""
+        raise RuntimeError("boom")
+
+    after_results: list[str] = []
+
+    def propagate_unexpected(event: AfterToolCallEvent):
+        if event.exception is not None:
+            raise event.exception
+
+    def record(event: AfterToolCallEvent):
+        after_results.append(event.result["content"][0]["text"])
+
+    agent = Agent(
+        model=_single_tool_use_model([{"toolUseId": "t1", "name": "failing_tool", "input": {}}]),
+        tools=[failing_tool],
+        callback_handler=None,
+    )
+    # AfterToolCallEvent callbacks run in reverse registration order: `record` runs first.
+    agent.hooks.add_callback(AfterToolCallEvent, propagate_unexpected)
+    agent.hooks.add_callback(AfterToolCallEvent, record)
+
+    with pytest.raises(EventLoopException) as raised:
+        agent("go")
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert len(after_results) == 1

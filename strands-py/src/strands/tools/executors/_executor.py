@@ -361,26 +361,6 @@ class ToolExecutor(abc.ABC):
                 exception = result_event.exception
 
                 tool_duration = time.monotonic() - tool_start_time
-                after_event, _ = await agent.hooks.invoke_callbacks_async(
-                    AfterToolCallEvent[LocalAgent](
-                        agent=agent,
-                        selected_tool=selected_tool,
-                        tool_use=tool_use,
-                        invocation_state=invocation_state,
-                        result=result,
-                        exception=exception,
-                        duration=tool_duration,
-                    )
-                )
-
-                if ToolExecutor._should_retry(agent, after_event):
-                    logger.debug("tool_name=<%s> | retry requested, retrying tool call", tool_name)
-                    continue
-
-                result = _with_tool_use_id(after_event.result, tool_use_id)
-                yield ToolResultEvent(result, exception=after_event.exception)
-                tool_results.append(result)
-                return
 
             except InterruptException as interrupt_exception:
                 # Middleware-initiated interrupt (context.interrupt() with no response yet).
@@ -420,6 +400,29 @@ class ToolExecutor(abc.ABC):
                 yield ToolResultEvent(error_result, exception=after_event.exception)
                 tool_results.append(error_result)
                 return
+
+            # Outside the try: an exception raised by an AfterToolCallEvent hook propagates instead of reaching the
+            # handler above, which would invoke the hooks a second time for the same call.
+            after_event, _ = await agent.hooks.invoke_callbacks_async(
+                AfterToolCallEvent[LocalAgent](
+                    agent=agent,
+                    selected_tool=selected_tool,
+                    tool_use=tool_use,
+                    invocation_state=invocation_state,
+                    result=result,
+                    exception=exception,
+                    duration=tool_duration,
+                )
+            )
+
+            if ToolExecutor._should_retry(agent, after_event):
+                logger.debug("tool_name=<%s> | retry requested, retrying tool call", tool_name)
+                continue
+
+            result = _with_tool_use_id(after_event.result, tool_use_id)
+            yield ToolResultEvent(result, exception=after_event.exception)
+            tool_results.append(result)
+            return
 
     @staticmethod
     async def _stream_with_trace(
