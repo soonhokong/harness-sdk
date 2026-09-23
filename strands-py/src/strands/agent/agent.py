@@ -133,6 +133,51 @@ async def _link_cancel_signal(external: threading.Event, internal: threading.Eve
     internal.set()
 
 
+def _retrieve_exception(task: "asyncio.Task[None]") -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+class _InvocationStream(AsyncGenerator[Any, None]):
+    """The events of one invocation, closed at once if the consumer drops them unfinished.
+
+    Leaving ``async for`` early does not close an async generator: the invocation would hold the
+    invocation lock until the event loop's async-generator finalizer runs ``aclose()`` on a later
+    loop turn. Dropping this wrapper schedules that ``aclose()`` immediately, and the agent's next
+    invocation on the same loop waits for it before taking the lock.
+    """
+
+    def __init__(self, agent: "Agent", events: AsyncGenerator[Any, None]) -> None:
+        self._agent = agent
+        self._events = events
+
+    def __aiter__(self) -> "_InvocationStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        return await self._events.__anext__()
+
+    async def asend(self, value: Any) -> Any:
+        return await self._events.asend(value)
+
+    async def athrow(self, *args: Any) -> Any:
+        return await self._events.athrow(*args)
+
+    async def aclose(self) -> None:
+        await self._events.aclose()
+
+    def __del__(self) -> None:
+        if getattr(self._events, "ag_frame", None) is None or getattr(self._events, "ag_running", False):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        close = loop.create_task(self._events.aclose())
+        close.add_done_callback(_retrieve_exception)
+        self._agent._pending_stream_close = close
+
+
 # TypeVar for generic structured output
 T = TypeVar("T", bound=BaseModel)
 
@@ -414,6 +459,7 @@ class Agent(AgentBase, LocalAgent):
 
         # Create internal cancel signal for graceful cancellation using threading.Event
         self._cancel_signal = threading.Event()
+        self._pending_stream_close: asyncio.Task[None] | None = None
         # Caller-owned external cancel signal for the current invocation, if any.
         self._external_cancel_signal: threading.Event | None = None
 
@@ -1247,7 +1293,7 @@ class Agent(AgentBase, LocalAgent):
 
         return asyncio.create_task(_link_cancel_signal(cancel_signal, self._cancel_signal))
 
-    async def stream_async(
+    def stream_async(
         self,
         prompt: AgentInput = None,
         *,
@@ -1322,7 +1368,42 @@ class Agent(AgentBase, LocalAgent):
                     yield event["data"]
             ```
         """
+        return _InvocationStream(
+            self,
+            self._stream_events(
+                prompt,
+                invocation_state=invocation_state,
+                structured_output_model=structured_output_model,
+                structured_output_prompt=structured_output_prompt,
+                idempotency_token=idempotency_token,
+                limits=limits,
+                cancel_signal=cancel_signal,
+                **kwargs,
+            ),
+        )
+
+    async def _await_pending_stream_close(self) -> None:
+        """Wait for a stream the consumer dropped unfinished on this loop to finish closing."""
+        pending = self._pending_stream_close
+        if pending is None or pending.done() or pending.get_loop() is not asyncio.get_running_loop():
+            return
+        await asyncio.wait([pending])
+
+    async def _stream_events(
+        self,
+        prompt: AgentInput,
+        *,
+        invocation_state: dict[str, Any] | None,
+        structured_output_model: type[BaseModel] | None,
+        structured_output_prompt: str | None,
+        idempotency_token: Any,
+        limits: Limits | None,
+        cancel_signal: threading.Event | None,
+        **kwargs: Any,
+    ) -> AsyncGenerator[Any, None]:
+        """Run one invocation and yield its events; see ``stream_async``."""
         self._validate_limits(limits)
+        await self._await_pending_stream_close()
 
         begin = self._concurrency.begin(idempotency_token)
 

@@ -630,3 +630,15 @@ async def test_cancel_while_tool_runs_does_not_re_execute_the_tool():
     agent._cancel_signal.clear()
     await agent.invoke_async(response)
     assert ran == ["executed"]
+
+
+@pytest.mark.asyncio
+async def test_agent_reusable_after_consumer_breaks_out_of_stream():
+    """Breaking out of ``async for`` over stream_async leaves the agent reusable for the next call."""
+    agent = Agent(model=MockedModelProvider([DEFAULT_RESPONSE, DEFAULT_RESPONSE]), callback_handler=None)
+
+    async for _event in agent.stream_async("first"):
+        break
+
+    result = await agent.invoke_async("second")
+    assert result.stop_reason == "end_turn"
