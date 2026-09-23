@@ -182,6 +182,9 @@ class ToolExecutor(abc.ABC):
         """
         logger.debug("tool_use=<%s> | streaming", tool_use)
         tool_name = tool_use["name"]
+        # Results keep the model-issued toolUseId even when hooks replace tool_use or the result, so the provider
+        # and the interrupt resume filter can match them to the assistant's tool use.
+        tool_use_id = str(tool_use.get("toolUseId"))
         structured_output_context = structured_output_context or StructuredOutputContext()
 
         tool_func = _lookup_tool(agent, tool_name)
@@ -249,14 +252,17 @@ class ToolExecutor(abc.ABC):
                         cancel_message=cancel_message,
                     )
                 )
-                yield ToolResultEvent(after_event.result)
-                tool_results.append(after_event.result)
+                cancel_result = _with_tool_use_id(after_event.result, tool_use_id)
+                yield ToolResultEvent(cancel_result)
+                tool_results.append(cancel_result)
                 return
 
             try:
                 tool_start_time = time.monotonic()
                 selected_tool = before_event.selected_tool
                 tool_use = before_event.tool_use
+                if tool_use.get("toolUseId") != tool_use_id:
+                    tool_use = cast(ToolUse, {**tool_use, "toolUseId": tool_use_id})
                 invocation_state = before_event.invocation_state
 
                 if selected_tool is tool_func and tool_use["name"] != tool_name:
@@ -275,6 +281,7 @@ class ToolExecutor(abc.ABC):
                     result = await background_tasks.submit_tool_call(
                         tool_use, invocation_state, pass_id, cast(AgentTool, selected_tool)
                     )
+                    result = _with_tool_use_id(result, tool_use_id)
                     yield ToolResultEvent(result, backgrounded=True)
                     tool_results.append(result)
                     return
@@ -370,8 +377,9 @@ class ToolExecutor(abc.ABC):
                     logger.debug("tool_name=<%s> | retry requested, retrying tool call", tool_name)
                     continue
 
-                yield ToolResultEvent(after_event.result, exception=after_event.exception)
-                tool_results.append(after_event.result)
+                result = _with_tool_use_id(after_event.result, tool_use_id)
+                yield ToolResultEvent(result, exception=after_event.exception)
+                tool_results.append(result)
                 return
 
             except InterruptException as interrupt_exception:
@@ -408,8 +416,9 @@ class ToolExecutor(abc.ABC):
                 if ToolExecutor._should_retry(agent, after_event):
                     logger.debug("tool_name=<%s> | retry requested after exception, retrying tool call", tool_name)
                     continue
-                yield ToolResultEvent(after_event.result, exception=after_event.exception)
-                tool_results.append(after_event.result)
+                error_result = _with_tool_use_id(after_event.result, tool_use_id)
+                yield ToolResultEvent(error_result, exception=after_event.exception)
+                tool_results.append(error_result)
                 return
 
     @staticmethod
@@ -528,6 +537,13 @@ def _route_background(
     # history keeps the model's original request.
     tool_use = cast(ToolUse, dict(tool_use))
     return tool_use, background_tasks.route_tool_call(tool_use, requested_tool, selected_tool)
+
+
+def _with_tool_use_id(result: ToolResult, tool_use_id: str) -> ToolResult:
+    """Return ``result`` carrying ``tool_use_id``, copying it only when a hook replaced the id."""
+    if result.get("toolUseId") == tool_use_id:
+        return result
+    return cast(ToolResult, {**result, "toolUseId": tool_use_id})
 
 
 def _lookup_tool(agent: "Agent | BidiAgent", tool_name: str) -> AgentTool | None:

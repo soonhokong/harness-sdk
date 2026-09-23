@@ -1146,3 +1146,107 @@ def test_before_model_call_hook_interrupt_stops_and_resumes_at_model_call():
     assert result.message["content"][0]["text"] == "Approved"
     assert responses_seen == ["yes"]
     assert agent._interrupt_state.activated is False
+
+
+def _tool_result_ids(agent):
+    return [
+        content["toolResult"]["toolUseId"]
+        for message in agent.messages
+        for content in message["content"]
+        if "toolResult" in content
+    ]
+
+
+def _single_tool_use_model(tool_uses):
+    return MockedModelProvider(
+        [
+            {"role": "assistant", "content": [{"toolUse": tool_use} for tool_use in tool_uses]},
+            {"role": "assistant", "content": [{"text": "done"}]},
+        ]
+    )
+
+
+def test_before_tool_call_hook_replacing_tool_use_keeps_model_tool_use_id():
+    """A hook that replaces tool_use with another toolUseId must not orphan the model's tool use."""
+
+    @strands.tool
+    def ok_tool() -> str:
+        """Return ok."""
+        return "ok"
+
+    def replace_tool_use(event: BeforeToolCallEvent):
+        event.tool_use = {"toolUseId": "replaced", "name": event.tool_use["name"], "input": event.tool_use["input"]}
+
+    agent = Agent(
+        model=_single_tool_use_model([{"toolUseId": "t1", "name": "ok_tool", "input": {}}]),
+        tools=[ok_tool],
+        callback_handler=None,
+    )
+    agent.hooks.add_callback(BeforeToolCallEvent, replace_tool_use)
+
+    agent("go")
+
+    assert _tool_result_ids(agent) == ["t1"]
+
+
+def test_after_tool_call_hook_replacing_result_keeps_model_tool_use_id():
+    """A hook that replaces the result with one for another toolUseId must not orphan the model's tool use."""
+
+    @strands.tool
+    def ok_tool() -> str:
+        """Return ok."""
+        return "ok"
+
+    def replace_result(event: AfterToolCallEvent):
+        event.result = {"toolUseId": "replaced", "status": "success", "content": [{"text": "rewritten"}]}
+
+    agent = Agent(
+        model=_single_tool_use_model([{"toolUseId": "t1", "name": "ok_tool", "input": {}}]),
+        tools=[ok_tool],
+        callback_handler=None,
+    )
+    agent.hooks.add_callback(AfterToolCallEvent, replace_result)
+
+    agent("go")
+
+    assert _tool_result_ids(agent) == ["t1"]
+
+
+def test_replaced_tool_use_id_does_not_rerun_completed_tool_on_interrupt_resume():
+    """A completed tool whose result carries a hook-replaced id must not run again when the batch resumes."""
+    runs: list[str] = []
+
+    @strands.tool
+    def side_effect_tool() -> str:
+        """Record a run."""
+        runs.append("ran")
+        return "done"
+
+    @strands.tool(context=True)
+    def approver(tool_context) -> str:
+        """Require approval."""
+        tool_context.interrupt("approve")
+        return "approved"
+
+    def replace_tool_use(event: BeforeToolCallEvent):
+        if event.tool_use["name"] == "side_effect_tool":
+            event.tool_use = {"toolUseId": "replaced", "name": "side_effect_tool", "input": {}}
+
+    agent = Agent(
+        model=_single_tool_use_model(
+            [
+                {"toolUseId": "t1", "name": "side_effect_tool", "input": {}},
+                {"toolUseId": "t2", "name": "approver", "input": {}},
+            ]
+        ),
+        tools=[side_effect_tool, approver],
+        callback_handler=None,
+    )
+    agent.hooks.add_callback(BeforeToolCallEvent, replace_tool_use)
+
+    interrupted = agent("go")
+    assert interrupted.stop_reason == "interrupt"
+    agent([{"interruptResponse": {"interruptId": i.id, "response": "yes"}} for i in interrupted.interrupts])
+
+    assert runs == ["ran"]
+    assert sorted(_tool_result_ids(agent)) == ["t1", "t2"]

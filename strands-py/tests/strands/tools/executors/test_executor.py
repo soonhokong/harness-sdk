@@ -165,7 +165,7 @@ async def test_executor_stream_wraps_stream_events_if_no_result(
     )
 
     tru_events = await alist(stream)
-    exp_events = [last_event, ToolResultEvent(last_event)]
+    exp_events = [last_event, ToolResultEvent({**last_event, "toolUseId": "1"})]
     assert tru_events == exp_events
 
 
