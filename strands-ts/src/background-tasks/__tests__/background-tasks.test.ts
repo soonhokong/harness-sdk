@@ -495,4 +495,47 @@ describe('BackgroundTasks', () => {
     await agent.invoke('Continue.')
     expect(deliveries(agent)).toHaveLength(1)
   })
+
+  it('persists the status of work whose result holds undefined', async () => {
+    // App state accepts only JSON values. A result holding undefined must not stop the task's
+    // status from being persisted, or a restored snapshot reports completed work as failed.
+    let release!: () => void
+    const released = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const work = tool({
+      name: 'work',
+      description: 'Return a record with an optional field.',
+      inputSchema: z.object({}),
+      callback: async () => {
+        await released
+        return { json: { id: 'r1', label: undefined } }
+      },
+    })
+    const model = new MockMessageModel()
+      .addTurn({
+        type: 'toolUseBlock',
+        name: 'work',
+        toolUseId: 'work-use',
+        input: { _background_execution: true },
+      })
+      .addTurn({ type: 'textBlock', text: 'Task admitted.' })
+    const agent = new Agent({ model, tools: [work], backgroundTasks: { waitForCompletion: false }, printer: false })
+
+    await agent.invoke('Run work.')
+    release()
+    await expect
+      .poll(() => persistedTasks(agent)?.map((task) => task.status), { timeout: 1_000 })
+      .toEqual(['completed'])
+
+    const restored = new Agent({
+      model: new MockMessageModel().addTurn({ type: 'textBlock', text: 'Result received.' }),
+      tools: [],
+      backgroundTasks: {},
+      printer: false,
+    })
+    restored.loadSnapshot(agent.takeSnapshot({ preset: 'session' }))
+    await restored.invoke('Continue.')
+    expect(deliveries(restored)).toHaveLength(1)
+  })
 })

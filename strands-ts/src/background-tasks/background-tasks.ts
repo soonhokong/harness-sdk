@@ -12,7 +12,7 @@ import { STRUCTURED_OUTPUT_TOOL_NAME } from '../tools/structured-output-tool.js'
 import { tool } from '../tools/tool-factory.js'
 import type { Tool, ToolContext } from '../tools/tool.js'
 import type { ToolSpec } from '../tools/types.js'
-import { deepCopy } from '../types/json.js'
+import { deepCopy, type JSONValue } from '../types/json.js'
 import {
   JsonBlock,
   Message,
@@ -362,7 +362,7 @@ export class BackgroundTasks implements Plugin {
       this._agent.appState.delete(BACKGROUND_TASKS_STATE_KEY)
       return
     }
-    this._agent.appState.set(BACKGROUND_TASKS_STATE_KEY, [...this._tasks.values()])
+    this._agent.appState.set(BACKGROUND_TASKS_STATE_KEY, [...this._tasks.values()].map(persistableTask))
   }
 
   private _policyFor(
@@ -373,6 +373,26 @@ export class BackgroundTasks implements Plugin {
     if (exact) return { mode: exact, exact: true }
     const wildcard = this._policy.get('*')
     return wildcard ? { mode: wildcard, exact: false } : undefined
+  }
+}
+
+/**
+ * Returns a JSON-safe copy of a task snapshot for app state. App state accepts only JSON values, and
+ * one rejected snapshot would fail the whole write: values JSON drops (undefined, functions) are
+ * dropped, and a task JSON cannot copy at all keeps only its status and error.
+ */
+function persistableTask(task: BackgroundTask): JSONValue {
+  try {
+    return deepCopy(task)
+  } catch (error) {
+    logger.warn(
+      `task_id=<${task.taskId}>, error=<${error}> | background task is not JSON serializable, persisting its status only`
+    )
+    const { result: _result, interrupts, ...persisted } = task
+    return deepCopy({
+      ...persisted,
+      ...(interrupts && { interrupts: interrupts.map((interrupt) => ({ ...interrupt, reason: null })) }),
+    })
   }
 }
 
