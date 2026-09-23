@@ -173,6 +173,39 @@ def test_idempotency_retry_waits_for_inflight_primary_after_a_failed_primary():
     assert str(outcomes["E"]) == str(outcomes["C"])
 
 
+def test_idempotency_duplicate_gets_the_primary_error_when_the_prompt_is_rejected():
+    """A duplicate of a primary that rejects its prompt raises that error, not IdempotencyAbortedError."""
+    agent = Agent(
+        model=MockedModelProvider([{"role": "assistant", "content": [{"text": "unused"}]}]), callback_handler=None
+    )
+    controller = agent._concurrency
+    a_registered = threading.Event()
+    d_waiting = threading.Event()
+    original_begin = controller.begin
+
+    def begin(token):
+        outcome = original_begin(token)
+        if _caller.get() == "A":
+            a_registered.set()
+            _wait(d_waiting, "D to wait on A")
+        elif _caller.get() == "D" and outcome.waiting_on is not None:
+            d_waiting.set()
+        return outcome
+
+    controller.begin = begin
+    outcomes = {}
+
+    thread_a = _run_as("A", lambda: agent(123, idempotency_token="T"), outcomes)
+    _wait(a_registered, "A to register T")
+    thread_d = _run_as("D", lambda: agent("duplicate", idempotency_token="T"), outcomes)
+    for thread in (thread_a, thread_d):
+        thread.join(_WAIT)
+        assert not thread.is_alive(), f"{thread.name} hung"
+
+    assert isinstance(outcomes["A"], ValueError)
+    assert outcomes["D"] is outcomes["A"]
+
+
 @pytest.fixture(autouse=True)
 def _reset_caller():
     token = _caller.set(None)

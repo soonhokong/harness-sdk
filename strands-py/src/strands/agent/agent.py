@@ -1422,7 +1422,6 @@ class Agent(AgentBase, LocalAgent):
 
                 except Exception as e:
                     self._end_agent_trace_span(error=e)
-                    self._concurrency.complete(begin.registered, error=e)
                     raise
                 except BaseException as cancellation:
                     # Waiter settlement deferred to the finally block (aborted path) — propagating
@@ -1430,6 +1429,10 @@ class Agent(AgentBase, LocalAgent):
                     self._end_agent_trace_span(cancellation=cancellation)
                     raise
 
+        except Exception as error:
+            # Covers failures before the event loop starts too (resume validation, prompt conversion).
+            self._concurrency.complete(begin.registered, error=error)
+            raise
         finally:
             if cancel_watcher is not None:
                 # cancel() is enough: a cancelled task never resumes into internal.set(). Awaiting
