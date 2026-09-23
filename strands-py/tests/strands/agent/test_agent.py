@@ -3946,8 +3946,9 @@ async def test_agent_tool_results_follow_tool_use_order_with_invalid_tool_name()
 
 
 @pytest.mark.asyncio
-async def test_agent_tool_results_follow_tool_use_order_after_interrupt_resume():
-    """Tool results follow the order of the model's tool uses when an interrupt splits the batch."""
+async def test_agent_resumed_tool_results_keep_stored_results_first_in_tool_use_order():
+    """On an interrupt resume the stored results come first, then this pass's results; each part follows the
+    order of the model's tool uses, including an invalid tool name."""
 
     @strands.tool(context=True)
     def approver(tool_context: ToolContext) -> str:
@@ -3965,6 +3966,7 @@ async def test_agent_tool_results_follow_tool_use_order_after_interrupt_resume()
         "content": [
             {"toolUse": {"toolUseId": "t1", "name": "approver", "input": {}}},
             {"toolUse": {"toolUseId": "t2", "name": "ok_tool", "input": {}}},
+            {"toolUse": {"toolUseId": "t3", "name": "functions.ok_tool", "input": {}}},
         ],
     }
     agent = Agent(
@@ -3978,7 +3980,7 @@ async def test_agent_tool_results_follow_tool_use_order_after_interrupt_resume()
     responses = [{"interruptResponse": {"interruptId": i.id, "response": "yes"}} for i in interrupted.interrupts]
     await agent.invoke_async(responses)
 
-    assert _tool_result_ids_in(agent.messages[2]) == ["t1", "t2"]
+    assert _tool_result_ids_in(agent.messages[2]) == ["t2", "t3", "t1"]
 
 
 @pytest.mark.asyncio

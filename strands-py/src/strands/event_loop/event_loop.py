@@ -799,18 +799,22 @@ async def _stop_for_interrupts(
         tracer.end_event_loop_cycle_span(span=cycle_span, message=message)
 
 
-def _in_tool_use_order(message: Message, tool_results: list[ToolResult]) -> list[ToolResult]:
-    """Order tool results by the tool uses of the assistant message that requested them.
+def _in_tool_use_order(message: Message, tool_results: list[ToolResult], stored_count: int) -> list[ToolResult]:
+    """Order tool results for the tool-result message of the assistant message that requested them.
 
-    Validation errors and results restored when resuming an interrupt are collected before the executor's results,
-    so collection order does not follow the request. Results whose id matches no tool use keep their relative order
-    at the end.
+    Results restored when resuming an interrupt (the first ``stored_count``) stay first. Within the restored results
+    and within this pass's results, validation errors are collected before the executor's results, so each part is
+    ordered by the tool uses. Results whose id matches no tool use keep their relative order at the end of a part.
     """
     positions: dict[str, int] = {}
     for content in message["content"]:
         if "toolUse" in content:
             positions.setdefault(content["toolUse"]["toolUseId"], len(positions))
-    return sorted(tool_results, key=lambda result: positions.get(result.get("toolUseId", ""), len(positions)))
+
+    def ordered(results: list[ToolResult]) -> list[ToolResult]:
+        return sorted(results, key=lambda result: positions.get(result.get("toolUseId", ""), len(positions)))
+
+    return ordered(tool_results[:stored_count]) + ordered(tool_results[stored_count:])
 
 
 async def _handle_tool_execution(
@@ -849,11 +853,13 @@ async def _handle_tool_execution(
     """
     tool_uses: list[ToolUse] = [content["toolUse"] for content in message["content"] if "toolUse" in content]
     tool_results: list[ToolResult] = []
+    stored_result_count = 0
 
     # Merge tool results from a resumed tool interrupt.
     pending_tool_execution = agent._interrupt_state.pending_tool_execution
     if agent._interrupt_state.activated and pending_tool_execution is not None:
         tool_results.extend(pending_tool_execution.completed_tool_results)
+        stored_result_count = len(tool_results)
 
         # Filter to only the interrupted tools when resuming from interrupt (tool uses without results)
         tool_use_ids = {tool_result["toolUseId"] for tool_result in tool_results}
@@ -931,7 +937,9 @@ async def _handle_tool_execution(
         # Always pair BeforeToolsEvent with AfterToolsEvent, even on cancel/interrupt/error paths.
         tool_result_message: Message = {
             "role": "user",
-            "content": [{"toolResult": result} for result in _in_tool_use_order(message, tool_results)],
+            "content": [
+                {"toolResult": result} for result in _in_tool_use_order(message, tool_results, stored_result_count)
+            ],
         }
         after_tools_event = AfterToolsEvent(agent=agent, message=tool_result_message, invocation_state=invocation_state)
         try:

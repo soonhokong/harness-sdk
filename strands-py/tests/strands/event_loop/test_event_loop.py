@@ -1978,16 +1978,16 @@ async def test_event_loop_cycle_interrupt_resume(agent, model, tool, tool_times_
         "content": [
             {
                 "toolResult": {
-                    "toolUseId": "t1",
+                    "toolUseId": "t2",
                     "status": "success",
-                    "content": [{"text": "test input"}],
+                    "content": [{"text": "t2 result"}],
                 },
             },
             {
                 "toolResult": {
-                    "toolUseId": "t2",
+                    "toolUseId": "t1",
                     "status": "success",
-                    "content": [{"text": "t2 result"}],
+                    "content": [{"text": "test input"}],
                 },
             },
         ],
