@@ -1488,13 +1488,15 @@ class Agent(AgentBase, LocalAgent):
                     if isinstance(before_invocation_event.cancel, str)
                     else "invocation denied by hook"
                 )
+                # A denied pass never incorporates the previous pass's continuation; settle it before
+                # appending the cancel message, whose MessageAddedEvent hooks may raise.
+                await _continuation.abandon(
+                    continuation_event, RuntimeError("Continuation was not incorporated into agent history")
+                )
                 cancel_message: Message = {"role": "assistant", "content": [{"text": cancel_text}]}
                 await self._append_messages(cancel_message)
                 yield EventLoopStopEvent(
                     "end_turn", cancel_message, self.event_loop_metrics, invocation_state.get("request_state", {})
-                )
-                await _continuation.abandon(
-                    continuation_event, RuntimeError("Continuation was not incorporated into agent history")
                 )
                 after_invocation_event = AfterInvocationEvent(agent=self, invocation_state=invocation_state)
                 try:

@@ -320,3 +320,32 @@ async def test_rejects_input_added_after_its_event_was_prepared() -> None:
     late_appended.assert_not_called()
     assert len(late_errors) == 1
 
+
+@pytest.mark.asyncio
+async def test_abandons_continuation_when_the_cancel_message_cannot_be_appended() -> None:
+    abandoned = Mock()
+    agent = Agent(model=_text_model("initial", "unreachable"), callback_handler=None)
+    passes = 0
+
+    def add_follow_up(event: AfterInvocationEvent) -> None:
+        if passes == 1:
+            add_input(event, _ContinuationInput(args="pending", on_abandoned=abandoned))
+
+    def deny_continuation(event: BeforeInvocationEvent) -> None:
+        nonlocal passes
+        passes += 1
+        if passes == 2:
+            event.cancel = "denied"
+
+    def fail_on_cancel_message(event: MessageAddedEvent) -> None:
+        if _text_of(event.message) == "denied":
+            raise RuntimeError("storage unavailable")
+
+    agent.hooks.add_callback(AfterInvocationEvent, add_follow_up)
+    agent.hooks.add_callback(BeforeInvocationEvent, deny_continuation)
+    agent.hooks.add_callback(MessageAddedEvent, fail_on_cancel_message)
+
+    with pytest.raises(RuntimeError, match="storage unavailable"):
+        await agent.invoke_async("start")
+
+    abandoned.assert_called_once()
