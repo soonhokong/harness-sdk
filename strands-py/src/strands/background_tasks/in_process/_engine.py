@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import math
 from collections.abc import Awaitable, Callable
@@ -25,6 +26,7 @@ from ._types import (
 )
 
 _DEFAULT_EXECUTION_FAILURE_MESSAGE = "Background task execution failed"
+_CANCELLED_EXECUTION_MESSAGE = "Background task execution was cancelled"
 
 
 @dataclass
@@ -224,6 +226,18 @@ class InProcessTaskEngine:
                 status="failed",
                 failure={"type": "execution_error", "message": _execution_failure_message(error)},
             )
+        except BaseException:
+            # The execution itself was cancelled (e.g. its origin event loop shut down). Settle a task that
+            # cancel or timeout has not already settled, so it cannot stay "working" with no execution left.
+            with contextlib.suppress(Exception):
+                self._finish_outcome(
+                    task_id,
+                    FailedTaskExecutionOutcome(
+                        status="failed",
+                        failure={"type": "execution_error", "message": _CANCELLED_EXECUTION_MESSAGE},
+                    ),
+                )
+            raise
         try:
             self._finish_outcome(task_id, outcome)
         except Exception as error:

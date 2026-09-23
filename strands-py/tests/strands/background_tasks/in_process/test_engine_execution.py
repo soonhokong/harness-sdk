@@ -116,6 +116,39 @@ async def test_execution_propagates_asyncio_cancellation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execution_cancelled_by_asyncio_fails_working_task() -> None:
+    # The execution's own asyncio task is cancelled (e.g. its origin loop shuts down) without an
+    # engine cancel: the task must not stay "working" with no execution left to finish it.
+    started = asyncio.Event()
+    execution_task: asyncio.Task[None] | None = None
+
+    async def execute(_: InProcessTaskExecutionContext) -> InProcessTaskExecutionOutcome:
+        nonlocal execution_task
+        execution_task = asyncio.current_task()
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    engine = create_engine(execute)
+    task = engine.submit(**create_admission("cancel"))
+    await started.wait()
+    assert execution_task is not None
+
+    execution_task.cancel()
+    await engine.wait_for_idle()
+
+    assert execution_task.cancelled()
+    assert_task(
+        engine.get(task["task_id"]),
+        task,
+        {
+            "status": "failed",
+            "failure": {"type": "execution_error", "message": "Background task execution was cancelled"},
+        },
+    )
+
+
+@pytest.mark.asyncio
 async def test_execution_records_classified_failures() -> None:
     async def throw_error(_: InProcessTaskExecutionContext) -> InProcessTaskExecutionOutcome:
         raise TypeError("Execution exploded")

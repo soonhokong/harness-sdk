@@ -11,7 +11,7 @@ import pytest
 
 from strands import Agent, ToolContext, tool
 from strands._middleware.stages import ExecuteToolStage, InvokeModelStage
-from strands.hooks import AfterToolCallEvent, AgentInitializedEvent, BeforeToolCallEvent
+from strands.hooks import AfterToolCallEvent, AgentInitializedEvent, BeforeToolCallEvent, MessageAddedEvent
 from strands.interrupt import Interrupt
 from strands.tools.tools import PythonAgentTool
 from strands.types._events import ToolResultEvent
@@ -643,6 +643,92 @@ def test_sync_background_work_survives_between_invocations() -> None:
     exp_delivery_count = 1
     assert tru_delivery_count == exp_delivery_count
     assert _persisted_tasks(agent) is None
+
+
+def _wait_for_terminal_persisted_task(agent: Agent) -> dict[str, Any] | None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        tasks = _persisted_tasks(agent)
+        if tasks and tasks[0]["status"] in {"completed", "failed", "cancelled"}:
+            return tasks[0]
+        time.sleep(0.01)
+    return None
+
+
+def test_settles_work_cancelled_by_origin_event_loop_shutdown() -> None:
+    # asyncio.run() cancels every task left on its loop, including a background tool that was
+    # still running there. The task must still settle, be delivered, and stop blocking snapshots.
+    @tool(name="work")
+    async def work() -> str:
+        """Perform slow work."""
+        await asyncio.sleep(0.2)
+        return "done"
+
+    agent = Agent(
+        model=MockedModelProvider(
+            [
+                _assistant_tool_use("work", "work-use", {"_background_execution": True}),
+                _assistant_text("Task admitted."),
+                _assistant_text("Result received."),
+            ]
+        ),
+        tools=[work],
+        background_tasks={"wait_for_completion": False},
+        callback_handler=None,
+    )
+
+    asyncio.run(agent.invoke_async("Run work."))
+
+    settled = _wait_for_terminal_persisted_task(agent)
+    assert settled is not None, f"background task stranded: {_persisted_tasks(agent)}"
+    assert settled["status"] == "failed"
+
+    asyncio.run(agent.invoke_async("Continue."))
+    tru_delivery_count = len(_deliveries(agent.messages))
+    exp_delivery_count = 1
+    assert tru_delivery_count == exp_delivery_count
+    assert _persisted_tasks(agent) is None
+    agent.load_snapshot(agent.take_snapshot(include=["state"]))
+
+
+def test_next_invocation_returns_after_work_cancelled_by_origin_event_loop_shutdown() -> None:
+    # Default wait_for_completion=True: a cancelled invocation returns without waiting, its loop
+    # shuts down and cancels the tool. The next invocation must not wait forever for that task.
+    @tool(name="work")
+    async def work() -> str:
+        """Perform slow work."""
+        await asyncio.sleep(0.2)
+        return "done"
+
+    agent = Agent(
+        model=MockedModelProvider(
+            [
+                _assistant_tool_use("work", "work-use", {"_background_execution": True}),
+                _assistant_text("Result received."),
+                _assistant_text("Result received."),
+            ]
+        ),
+        tools=[work],
+        background_tasks={},
+        callback_handler=None,
+    )
+
+    def cancel_after_dispatch(event: MessageAddedEvent) -> None:
+        if any("toolResult" in block for block in event.message["content"]) and not _deliveries(agent.messages):
+            event.agent.cancel()
+
+    agent.add_hook(cancel_after_dispatch, MessageAddedEvent)
+    cancelled = asyncio.run(agent.invoke_async("Run work."))
+    assert cancelled.stop_reason == "cancelled"
+
+    async def continue_with_timeout() -> Any:
+        return await asyncio.wait_for(agent.invoke_async("Continue."), timeout=3)
+
+    result = asyncio.run(continue_with_timeout())
+    assert result.stop_reason == "end_turn"
+    tru_delivery_count = len(_deliveries(agent.messages))
+    exp_delivery_count = 1
+    assert tru_delivery_count == exp_delivery_count
 
 
 @pytest.mark.asyncio
