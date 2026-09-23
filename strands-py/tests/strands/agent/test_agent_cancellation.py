@@ -1,6 +1,7 @@
 """Tests for agent cancellation functionality using agent.cancel() API."""
 
 import asyncio
+import inspect
 import threading
 import time
 from unittest.mock import ANY
@@ -16,6 +17,7 @@ from strands.hooks import (
     BeforeToolsEvent,
 )
 from strands.types.agent import ConcurrentInvocationMode
+from strands.types.exceptions import ConcurrencyException
 from tests.fixtures.mocked_model_provider import MockedModelProvider
 
 # Default agent response for simple tests
@@ -783,6 +785,36 @@ async def test_unsafe_reentrant_cancel_signal_isolated_between_streams_stepped_i
 
     assert last["a"]["result"].stop_reason == "end_turn"
     assert last["b"]["result"].stop_reason == "cancelled"
+
+
+def test_stream_async_returns_an_async_generator():
+    agent = Agent(model=MockedModelProvider([DEFAULT_RESPONSE]), callback_handler=None)
+
+    stream = agent.stream_async("hello")
+
+    assert inspect.isasyncgen(stream)
+    asyncio.run(stream.aclose())
+
+
+@pytest.mark.asyncio
+async def test_direct_tool_call_right_after_leaving_stream_async_names_the_closing_stream():
+    """A synchronous direct tool call cannot wait for a left stream to close; the error says how to proceed."""
+
+    @tool
+    def ping() -> str:
+        """Reply pong."""
+        return "pong"
+
+    agent = Agent(model=MockedModelProvider([DEFAULT_RESPONSE, DEFAULT_RESPONSE]), tools=[ping], callback_handler=None)
+
+    async for _event in agent.stream_async("first"):
+        break
+
+    with pytest.raises(ConcurrencyException, match="aclose"):
+        agent.tool.ping(record_direct_tool_call=True)
+
+    await agent.invoke_async("second")
+    assert agent.tool.ping(record_direct_tool_call=True)["status"] == "success"
 
 
 @pytest.mark.asyncio

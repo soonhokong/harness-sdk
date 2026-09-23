@@ -13,9 +13,11 @@ import asyncio
 import contextvars
 import copy
 import logging
+import sys
 import threading
 import uuid
 import warnings
+import weakref
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import (
@@ -157,49 +159,13 @@ def _reset_binding(token: "contextvars.Token[Mapping[int, _InvocationCancel] | N
         _INVOCATION_CANCELS.reset(token)
 
 
-def _retrieve_exception(task: "asyncio.Task[None]") -> None:
-    if not task.cancelled():
-        task.exception()
+@dataclass(eq=False)
+class _StreamLifetime:
+    """Whether an invocation stream holds the invocation, and when it has finished closing."""
 
-
-class _InvocationStream(AsyncGenerator[Any, None]):
-    """The events of one invocation, closed at once if the consumer drops them unfinished.
-
-    Leaving ``async for`` early does not close an async generator: the invocation would hold the
-    invocation lock until the event loop's async-generator finalizer runs ``aclose()`` on a later
-    loop turn. Dropping this wrapper schedules that ``aclose()`` immediately, and the agent's next
-    invocation on the same loop waits for it before taking the lock.
-    """
-
-    def __init__(self, agent: "Agent", events: AsyncGenerator[Any, None]) -> None:
-        self._agent = agent
-        self._events = events
-
-    def __aiter__(self) -> "_InvocationStream":
-        return self
-
-    async def __anext__(self) -> Any:
-        return await self._events.__anext__()
-
-    async def asend(self, value: Any) -> Any:
-        return await self._events.asend(value)
-
-    async def athrow(self, *args: Any) -> Any:
-        return await self._events.athrow(*args)
-
-    async def aclose(self) -> None:
-        await self._events.aclose()
-
-    def __del__(self) -> None:
-        if getattr(self._events, "ag_frame", None) is None or getattr(self._events, "ag_running", False):
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        close = loop.create_task(self._events.aclose())
-        close.add_done_callback(_retrieve_exception)
-        self._agent._pending_stream_close = close
+    closed: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set when the stream takes the invocation lock; the loop that will run its close.
+    loop: asyncio.AbstractEventLoop | None = None
 
 
 # TypeVar for generic structured output
@@ -485,7 +451,8 @@ class Agent(AgentBase, LocalAgent):
         # invocation has its own signal (see _cancel_signal); this one then only carries a cancel()
         # made while no invocation runs.
         self._agent_cancel_signal = threading.Event()
-        self._pending_stream_close: asyncio.Task[None] | None = None
+        # A stream whose consumer dropped it before it finished, until the event loop closes it.
+        self._dropped_stream: _StreamLifetime | None = None
         # Caller-owned external cancel signal for the current invocation, if any (THROW mode).
         self._external_cancel_signal: threading.Event | None = None
         self._running_invocation_cancels: set[_InvocationCancel] = set()
@@ -1421,19 +1388,31 @@ class Agent(AgentBase, LocalAgent):
                     yield event["data"]
             ```
         """
-        return _InvocationStream(
-            self,
-            self._stream_events(
-                prompt,
-                invocation_state=invocation_state,
-                structured_output_model=structured_output_model,
-                structured_output_prompt=structured_output_prompt,
-                idempotency_token=idempotency_token,
-                limits=limits,
-                cancel_signal=cancel_signal,
-                **kwargs,
-            ),
+        lifetime = _StreamLifetime()
+        events = self._stream_events(
+            prompt,
+            lifetime=lifetime,
+            invocation_state=invocation_state,
+            structured_output_model=structured_output_model,
+            structured_output_prompt=structured_output_prompt,
+            idempotency_token=idempotency_token,
+            limits=limits,
+            cancel_signal=cancel_signal,
+            **kwargs,
         )
+        # Leaving `async for` early does not close an async generator; it is closed by the event loop's
+        # async-generator finalizer on a later loop turn. This callback runs as soon as the consumer
+        # drops the stream, so the next invocation can wait for that close instead of failing.
+        weakref.finalize(events, self._on_stream_dropped, lifetime)
+        return events
+
+    def _on_stream_dropped(self, lifetime: _StreamLifetime) -> None:
+        if lifetime.loop is not None and not lifetime.closed.is_set():
+            self._dropped_stream = lifetime
+
+    def _dropped_stream_is_closing(self) -> bool:
+        dropped = self._dropped_stream
+        return dropped is not None and not dropped.closed.is_set()
 
     def _begin_invocation_cancel(self, cancel_signal: threading.Event | None) -> _InvocationCancel | None:
         """Give an UNSAFE_REENTRANT invocation its own cancel signal; None in THROW mode.
@@ -1458,17 +1437,21 @@ class Agent(AgentBase, LocalAgent):
         with self._running_invocation_cancels_lock:
             self._running_invocation_cancels.discard(invocation_cancel)
 
-    async def _await_pending_stream_close(self) -> None:
-        """Wait for a stream the consumer dropped unfinished on this loop to finish closing."""
-        pending = self._pending_stream_close
-        if pending is None or pending.done() or pending.get_loop() is not asyncio.get_running_loop():
+    async def _await_dropped_stream_close(self) -> None:
+        """Wait until a stream the consumer dropped unfinished on this loop has closed."""
+        dropped = self._dropped_stream
+        if not self._dropped_stream_is_closing() or dropped is None:
             return
-        await asyncio.wait([pending])
+        # The loop's async-generator finalizer closes the dropped stream; without it nothing would.
+        if dropped.loop is not asyncio.get_running_loop() or sys.get_asyncgen_hooks().finalizer is None:
+            return
+        await dropped.closed.wait()
 
     async def _stream_events(
         self,
         prompt: AgentInput,
         *,
+        lifetime: _StreamLifetime,
         invocation_state: dict[str, Any] | None,
         structured_output_model: type[BaseModel] | None,
         structured_output_prompt: str | None,
@@ -1479,7 +1462,7 @@ class Agent(AgentBase, LocalAgent):
     ) -> AsyncGenerator[Any, None]:
         """Run one invocation and yield its events; see ``stream_async``."""
         self._validate_limits(limits)
-        await self._await_pending_stream_close()
+        await self._await_dropped_stream_close()
 
         begin = self._concurrency.begin(idempotency_token)
 
@@ -1506,6 +1489,8 @@ class Agent(AgentBase, LocalAgent):
             self._concurrency.complete(begin.registered, error=exc)
             raise exc
 
+        if self._concurrency.mode == ConcurrentInvocationMode.THROW:
+            lifetime.loop = asyncio.get_running_loop()
         result: AgentResult | None = None
         cancel_watcher: asyncio.Task[None] | None = None
         invocation_cancel = self._begin_invocation_cancel(cancel_signal)
@@ -1618,6 +1603,7 @@ class Agent(AgentBase, LocalAgent):
             self._concurrency.complete(begin.registered, result=result)
             if self._concurrency.mode == ConcurrentInvocationMode.THROW:
                 self._concurrency.release_lock()
+            lifetime.closed.set()
             _reset_binding(binding)
 
     async def _run_loop(

@@ -98,6 +98,13 @@ class _ToolCaller:
             if should_lock:
                 if isinstance(agent, Agent):
                     acquired_lock = agent._concurrency.try_acquire_lock()
+                    if not acquired_lock and agent._dropped_stream_is_closing():
+                        # The dropped stream closes on the event loop, which this synchronous call blocks.
+                        raise ConcurrencyException(
+                            "Direct tool call cannot be made while a stream_async() call that was left early is "
+                            "still closing. Close the stream with `await stream.aclose()` before the tool call, "
+                            "or let the event loop run first."
+                        )
                     if not acquired_lock:
                         raise ConcurrencyException(
                             "Direct tool call cannot be made while the agent is in the middle of an invocation. "
