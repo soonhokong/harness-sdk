@@ -32,6 +32,7 @@ interface ContinuationState {
 }
 
 const stateByEvent = new WeakMap<AfterInvocationEvent | BeforeModelCallEvent, ContinuationState>()
+const sealedEvents = new WeakSet<AfterInvocationEvent | BeforeModelCallEvent>()
 const deferredInputsByAgent = new WeakMap<LocalAgent, ContinuationInput[]>()
 
 /**
@@ -52,8 +53,13 @@ export const continuations = {
  *
  * @param event - Event that owns the continuation input.
  * @param input - Input and optional settlement callbacks to register.
+ * @throws Error if the event's inputs were already prepared or settled; nothing would ever append or
+ *   abandon the input.
  */
 function addInput(event: AfterInvocationEvent | BeforeModelCallEvent, input: ContinuationInput): void {
+  if (sealedEvents.has(event)) {
+    throw new Error("continuation input added after the event's inputs were already settled")
+  }
   const state = stateByEvent.get(event) ?? { inputs: [] }
   state.inputs.push(input)
   stateByEvent.set(event, state)
@@ -81,6 +87,7 @@ async function prepare(
   }
   if (stopReason !== undefined && stopReason !== 'endTurn' && stopReason !== 'stopSequence') return undefined
 
+  sealedEvents.add(event)
   const deferredInputs = event instanceof AfterInvocationEvent ? deferredInputsByAgent.get(event.agent) : undefined
   if (deferredInputs) deferredInputsByAgent.delete(event.agent)
   const inputs = [...(deferredInputs ?? []), ...(stateByEvent.get(event)?.inputs ?? [])]
@@ -168,6 +175,7 @@ async function abandon(event: AfterInvocationEvent | BeforeModelCallEvent | unde
 function consumeInputs(event: AfterInvocationEvent | BeforeModelCallEvent): readonly ContinuationInput[] {
   const state = stateByEvent.get(event)
   stateByEvent.delete(event)
+  sealedEvents.add(event)
   return state?.inputs ?? []
 }
 

@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import { MockMessageModel } from '../../__fixtures__/mock-message-model.js'
 import { createMockTool } from '../../__fixtures__/tool-helpers.js'
-import { AfterInvocationEvent, BeforeModelCallEvent, MessageAddedEvent } from '../../hooks/events.js'
+import {
+  AfterInvocationEvent,
+  BeforeInvocationEvent,
+  BeforeModelCallEvent,
+  MessageAddedEvent,
+} from '../../hooks/events.js'
 import { InterruptResponseContent } from '../../types/interrupt.js'
 import { Message, TextBlock, ToolResultBlock, ToolUseBlock } from '../../types/messages.js'
 import { Agent } from '../agent.js'
@@ -225,5 +230,55 @@ describe('Agent continuation input', () => {
 
     expect(abandoned).toHaveBeenCalledOnce()
     expect(agent.messages.map(textOf)).toEqual(['start'])
+  })
+
+  it('rejects an input added after its event was settled', async () => {
+    const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'initial' })
+    const agent = new Agent({ model, printer: false })
+    const captured: AfterInvocationEvent[] = []
+    agent.addHook(AfterInvocationEvent, (event) => {
+      captured.push(event)
+    })
+
+    await agent.invoke('start')
+
+    const onAppended = vi.fn()
+    const onAbandoned = vi.fn()
+    expect(() => continuations.addInput(captured[0]!, { args: 'late', onAppended, onAbandoned })).toThrow(
+      /already settled/
+    )
+    expect(onAppended).not.toHaveBeenCalled()
+    expect(onAbandoned).not.toHaveBeenCalled()
+  })
+
+  it('rejects an input added after its event was prepared', async () => {
+    const model = new MockMessageModel()
+      .addTurn({ type: 'textBlock', text: 'initial' })
+      .addTurn({ type: 'textBlock', text: 'continued' })
+    const agent = new Agent({ model, printer: false })
+    const prepared: AfterInvocationEvent[] = []
+    const lateErrors: unknown[] = []
+    const lateAppended = vi.fn()
+
+    agent.addHook(AfterInvocationEvent, (event) => {
+      if (prepared.length > 0) return
+      prepared.push(event)
+      continuations.addInput(event, { args: 'follow up' })
+    })
+    agent.addHook(BeforeInvocationEvent, () => {
+      if (prepared.length === 0 || lateErrors.length > 0) return
+      try {
+        continuations.addInput(prepared[0]!, { args: 'late', onAppended: lateAppended })
+      } catch (error) {
+        lateErrors.push(error)
+      }
+    })
+
+    const result = await agent.invoke('start')
+
+    expect(result.stopReason).toBe('endTurn')
+    expect(agent.messages.map(textOf)).toEqual(['start', 'initial', 'follow up', 'continued'])
+    expect(lateAppended).not.toHaveBeenCalled()
+    expect(lateErrors).toHaveLength(1)
   })
 })
