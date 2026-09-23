@@ -3836,6 +3836,51 @@ def _tool_result_ids_in(message):
     return [content["toolResult"]["toolUseId"] for content in message["content"] if "toolResult" in content]
 
 
+@pytest.mark.parametrize("tool_executor", [None, SequentialToolExecutor()], ids=["default", "sequential"])
+@pytest.mark.asyncio
+async def test_agent_tool_span_ends_when_a_tool_hook_raises(tool_executor):
+    """The execute_tool span is exported when a BeforeToolCallEvent hook raises."""
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    tracer = Tracer()
+    tracer.tracer_provider = provider
+    tracer.tracer = provider.get_tracer(tracer.service_name)
+
+    @strands.tool
+    def ok_tool() -> str:
+        """Return ok."""
+        return "ok"
+
+    def raising_hook(event: BeforeToolCallEvent):
+        raise RuntimeError("hook raised")
+
+    tool_use_message = {
+        "role": "assistant",
+        "content": [{"toolUse": {"toolUseId": "t1", "name": "ok_tool", "input": {}}}],
+    }
+    kwargs = {} if tool_executor is None else {"tool_executor": tool_executor}
+    with (
+        unittest.mock.patch("strands.agent.agent.get_tracer", return_value=tracer),
+        unittest.mock.patch("strands.event_loop.event_loop.get_tracer", return_value=tracer),
+        unittest.mock.patch("strands.tools.executors._executor.get_tracer", return_value=tracer),
+    ):
+        agent = Agent(
+            model=MockedModelProvider([tool_use_message, {"role": "assistant", "content": [{"text": "done"}]}]),
+            tools=[ok_tool],
+            callback_handler=None,
+            **kwargs,
+        )
+        agent.hooks.add_callback(BeforeToolCallEvent, raising_hook)
+        with pytest.raises(EventLoopException):
+            await agent.invoke_async("go")
+
+    tool_spans = [span for span in exporter.get_finished_spans() if span.name == "execute_tool ok_tool"]
+    assert len(tool_spans) == 1
+    assert tool_spans[0].status.status_code == StatusCode.ERROR
+
+
 @pytest.mark.asyncio
 async def test_agent_concurrent_tool_cancelled_error_does_not_drop_tool_result():
     """A tool whose body raises CancelledError gets a cancelled result; the agent answers every tool use."""

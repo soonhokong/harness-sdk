@@ -464,10 +464,18 @@ class ToolExecutor(abc.ABC):
         tool_start_time = time.time()
 
         with trace_api.use_span(tool_call_span):
-            async for event in ToolExecutor._stream(
-                agent, tool_use, tool_results, invocation_state, structured_output_context, **kwargs
-            ):
-                yield event
+            try:
+                async for event in ToolExecutor._stream(
+                    agent, tool_use, tool_results, invocation_state, structured_output_context, **kwargs
+                ):
+                    yield event
+            except BaseException as error:
+                # The call raised, was cancelled, or its stream was closed; the code below ends the span only
+                # after the stream finishes.
+                tracer.end_tool_call_span(
+                    tool_call_span, tool_result=None, error=error if isinstance(error, Exception) else None
+                )
+                raise
 
             if isinstance(event, ToolInterruptEvent):
                 tool_duration = time.time() - tool_start_time
