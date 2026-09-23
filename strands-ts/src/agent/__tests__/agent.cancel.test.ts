@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Agent } from '../agent.js'
-import { AfterInvocationEvent, AfterModelCallEvent, BeforeModelCallEvent } from '../../hooks/index.js'
+import { AfterInvocationEvent, AfterModelCallEvent, BeforeModelCallEvent, InitializedEvent } from '../../hooks/index.js'
 import { MockMessageModel } from '../../__fixtures__/mock-message-model.js'
 import { createMockTool } from '../../__fixtures__/tool-helpers.js'
 import { TextBlock, ToolResultBlock } from '../../types/messages.js'
 import { tool } from '../../tools/tool-factory.js'
+import { z } from 'zod'
 
 describe('Agent Cancellation', () => {
   describe('cancel() when idle', () => {
@@ -348,6 +349,100 @@ describe('Agent Cancellation', () => {
       const result = await agent.invoke('Hi')
       expect(result.stopReason).toBe('cancelled')
       expect(agent.cancelSignal.aborted).toBe(false)
+    })
+  })
+
+  describe('cancel during initialization', () => {
+    it('cancels when cancel() is called while the first invocation initializes', async () => {
+      const model = new MockMessageModel().addTurn({ type: 'textBlock', text: 'Hello' })
+      const agent = new Agent({ model, printer: false })
+      let finishInit!: () => void
+      const initGate = new Promise<void>((resolve) => (finishInit = resolve))
+      agent.addHook(InitializedEvent, async () => {
+        await initGate
+      })
+
+      const invocation = agent.invoke('Hi')
+      expect(agent.isInvoking).toBe(true)
+      agent.cancel()
+      finishInit()
+
+      const result = await invocation
+      expect(result.stopReason).toBe('cancelled')
+      expect(model.callCount).toBe(0)
+    })
+  })
+
+  describe('cancel while background tasks are pending', () => {
+    const settleWithin = <T>(promise: Promise<T>, ms: number): Promise<T | 'still waiting'> =>
+      Promise.race([promise, new Promise<'still waiting'>((resolve) => setTimeout(() => resolve('still waiting'), ms))])
+
+    function backgroundAgent(extraTools: ReturnType<typeof tool>[] = [], firstTurnExtra: object[] = []) {
+      let releaseSlow!: () => void
+      const slowGate = new Promise<void>((resolve) => (releaseSlow = resolve))
+      const slow = tool({
+        name: 'slow',
+        description: 'slow',
+        inputSchema: z.object({}).passthrough(),
+        callback: async () => {
+          await slowGate
+          return 'slow done'
+        },
+      })
+      const model = new MockMessageModel()
+        .addTurn([{ type: 'toolUseBlock', name: 'slow', toolUseId: 's-1', input: {} }, ...firstTurnExtra] as never)
+        .addTurn({ type: 'textBlock', text: 'Task admitted.' })
+        .addTurn({ type: 'textBlock', text: 'Slow result received.' })
+        .addTurn({ type: 'textBlock', text: 'spare' })
+      const agent = new Agent({
+        model,
+        tools: [slow, ...extraTools],
+        backgroundTasks: { always: [slow] },
+        printer: false,
+      })
+      return { agent, model, releaseSlow }
+    }
+
+    it('stops waiting for background tasks when the caller aborts its cancelSignal between passes', async () => {
+      const { agent, releaseSlow } = backgroundAgent()
+      const controller = new AbortController()
+      // The plugin registers its callbacks during initialize(); registered after them, this one runs
+      // first (AfterInvocationEvent callbacks run in reverse registration order).
+      await agent.initialize()
+      agent.addHook(AfterInvocationEvent, () => controller.abort())
+
+      const invocation = agent.invoke('Run it.', { cancelSignal: controller.signal })
+      const settled = await settleWithin(invocation, 500)
+      releaseSlow()
+
+      // The abort lands after the last checkpoint and no pass follows, so the result stays endTurn.
+      expect(settled === 'still waiting' ? settled : settled.stopReason).toBe('endTurn')
+      await invocation
+    })
+
+    it('stops waiting for background tasks when a tool cancels the pass', async () => {
+      let agentRef!: Agent
+      const stopper = tool({
+        name: 'stopper',
+        description: 'stopper',
+        inputSchema: z.object({}).passthrough(),
+        callback: async () => {
+          agentRef.cancel()
+          return 'stopped'
+        },
+      })
+      const { agent, releaseSlow } = backgroundAgent(
+        [stopper],
+        [{ type: 'toolUseBlock', name: 'stopper', toolUseId: 'x-1', input: {} }]
+      )
+      agentRef = agent
+
+      const invocation = agent.invoke('Run it.')
+      const settled = await settleWithin(invocation, 500)
+      releaseSlow()
+
+      expect(settled === 'still waiting' ? settled : settled.stopReason).toBe('cancelled')
+      await invocation
     })
   })
 

@@ -1179,6 +1179,14 @@ export class Agent implements LocalAgent, InvokableAgent {
     this.acquireLock()
     let continuationEvent: AfterInvocationEvent | undefined
     try {
+      // One AbortController per invocation, composed with any external signal and created as soon as
+      // the lock is held, so a cancel() during initialize() or between a pass and a resumed or
+      // continuation pass still cancels the invocation.
+      this._abortController = new AbortController()
+      this._abortSignal = options?.cancelSignal
+        ? AbortSignal.any([this._abortController.signal, options.cancelSignal])
+        : this._abortController.signal
+
       await this.initialize()
 
       // Thread the resolved invocationState so all layers share the same reference.
@@ -1186,13 +1194,6 @@ export class Agent implements LocalAgent, InvokableAgent {
       const resolvedOptions: InvokeOptions = options?.invocationState ? options : { ...options, invocationState }
 
       let currentArgs: InvokeArgs = args
-
-      // One AbortController per invocation, composed with any external signal, so a cancel() that
-      // lands between a pass and a resumed or continuation pass still cancels the invocation.
-      this._abortController = new AbortController()
-      this._abortSignal = resolvedOptions?.cancelSignal
-        ? AbortSignal.any([this._abortController.signal, resolvedOptions.cancelSignal])
-        : this._abortController.signal
 
       while (true) {
         // Process interrupt responses before middleware runs so context.interrupt() can find them
