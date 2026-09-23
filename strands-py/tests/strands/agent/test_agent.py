@@ -26,12 +26,13 @@ from strands.agent.conversation_manager.null_conversation_manager import NullCon
 from strands.agent.conversation_manager.sliding_window_conversation_manager import SlidingWindowConversationManager
 from strands.agent.state import AgentState
 from strands.handlers.callback_handler import PrintingCallbackHandler, null_callback_handler
-from strands.hooks import BeforeInvocationEvent, BeforeModelCallEvent, BeforeToolCallEvent
+from strands.hooks import BeforeInvocationEvent, BeforeModelCallEvent, BeforeToolCallEvent, BeforeToolsEvent
 from strands.interrupt import Interrupt, PendingToolExecution
 from strands.memory import MemoryManager, MemoryManagerConfig
 from strands.models.bedrock import DEFAULT_BEDROCK_MODEL_ID, BedrockModel
 from strands.session.repository_session_manager import RepositorySessionManager
 from strands.telemetry.tracer import Tracer, serialize
+from strands.tools.executors import SequentialToolExecutor
 from strands.types._events import EventLoopStopEvent, ModelStreamEvent
 from strands.types.agent import ConcurrentInvocationMode
 from strands.types.content import ContentBlock, Messages
@@ -3933,4 +3934,54 @@ async def test_agent_tool_results_follow_tool_use_order_after_interrupt_resume()
     responses = [{"interruptResponse": {"interruptId": i.id, "response": "yes"}} for i in interrupted.interrupts]
     await agent.invoke_async(responses)
 
+    assert _tool_result_ids_in(agent.messages[2]) == ["t1", "t2"]
+
+
+@pytest.mark.asyncio
+async def test_agent_before_tools_interrupt_on_resume_keeps_completed_tool_results():
+    """A BeforeToolsEvent interrupt on a resumed batch does not make a completed tool run again."""
+    charges: list[str] = []
+    passes = [0]
+
+    @strands.tool
+    def charge() -> str:
+        """Charge the card."""
+        charges.append("charged")
+        return "charged"
+
+    @strands.tool(context=True)
+    def approver(tool_context: ToolContext) -> str:
+        """Require approval on the first pass."""
+        if passes[0] == 1:
+            tool_context.interrupt("approve")
+        return "approved"
+
+    def batch_gate(event: BeforeToolsEvent):
+        passes[0] += 1
+        if passes[0] == 2:
+            event.interrupt("batch_gate", reason="confirm the batch")
+
+    tool_use_message = {
+        "role": "assistant",
+        "content": [
+            {"toolUse": {"toolUseId": "t1", "name": "charge", "input": {}}},
+            {"toolUse": {"toolUseId": "t2", "name": "approver", "input": {}}},
+        ],
+    }
+    agent = Agent(
+        model=MockedModelProvider([tool_use_message, {"role": "assistant", "content": [{"text": "done"}]}]),
+        tools=[charge, approver],
+        tool_executor=SequentialToolExecutor(),
+        callback_handler=None,
+    )
+    agent.hooks.add_callback(BeforeToolsEvent, batch_gate)
+
+    def responses():
+        return [{"interruptResponse": {"interruptId": i, "response": "yes"}} for i in agent._interrupt_state.interrupts]
+
+    assert (await agent.invoke_async("go")).stop_reason == "interrupt"
+    assert (await agent.invoke_async(responses())).stop_reason == "interrupt"
+    assert (await agent.invoke_async(responses())).stop_reason == "end_turn"
+
+    assert charges == ["charged"]
     assert _tool_result_ids_in(agent.messages[2]) == ["t1", "t2"]
