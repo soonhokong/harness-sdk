@@ -34,6 +34,8 @@ from ._types import (
     InterruptStateData,
 )
 
+_ORIGIN_LOOP_POLL_INTERVAL = 0.05
+
 
 class _MiddlewareInterrupt(Protocol):
     def __call__(
@@ -318,7 +320,7 @@ class InProcessTaskManager:
                 result = await execute_tool()
             else:
                 future = asyncio.run_coroutine_threadsafe(execute_tool(), execution.origin_loop)
-                result = await _await_origin_result(future, context.cancel_signal)
+                result = await _await_origin_result(future, context.cancel_signal, execution.origin_loop)
         except InterruptException as error:
             if error.interrupt.id not in interrupt_state.interrupts:
                 raise RuntimeError(f"Interrupt raised: {error.interrupt.name}") from error
@@ -347,6 +349,7 @@ class InProcessTaskManager:
 async def _await_origin_result(
     future: concurrent.futures.Future[ToolResult],
     cancel_signal: CancelSignal,
+    origin_loop: asyncio.AbstractEventLoop,
 ) -> ToolResult:
     loop = asyncio.get_running_loop()
     wrapped = asyncio.wrap_future(future)
@@ -367,6 +370,12 @@ async def _await_origin_result(
     try:
         pending: set[asyncio.Future[Any]] = {wrapped, aborted}
         await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        # Aborted (cancel or timeout) while the tool body still runs on a live origin loop: keep this
+        # execution, and so its concurrency slot, until the body returns, as on the runtime loop. The
+        # body sees the abort through its cancel signal; a sync tool cannot be stopped in its worker
+        # thread. A stopped origin loop cannot run the body, so its slot is reclaimed at once.
+        while not wrapped.done() and origin_loop.is_running():
+            await asyncio.wait({wrapped}, timeout=_ORIGIN_LOOP_POLL_INTERVAL)
         if wrapped.done():
             return wrapped.result()
         raise asyncio.CancelledError

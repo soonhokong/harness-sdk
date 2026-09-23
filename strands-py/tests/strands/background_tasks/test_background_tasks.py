@@ -972,6 +972,55 @@ def test_cancelled_delivery_releases_tasks_when_its_event_loop_shuts_down() -> N
     assert tru_delivery_count == exp_delivery_count
 
 
+def test_max_concurrency_bounds_tool_bodies_that_outlive_a_timeout() -> None:
+    # max_concurrency bounds physically executing background tasks. A sync tool keeps running in its
+    # worker thread after its task times out, so the slot must stay taken until the body returns.
+    lock = threading.Lock()
+    running = 0
+    peak = 0
+
+    @tool(name="slow")
+    def slow(n: int) -> str:
+        """Slow synchronous work that does not check for cancellation."""
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        time.sleep(0.2)
+        with lock:
+            running -= 1
+        return f"done {n}"
+
+    uses = [
+        {"toolUse": {"name": "slow", "toolUseId": f"slow-use-{n}", "input": {"n": n, "_background_execution": True}}}
+        for n in range(3)
+    ]
+    agent = Agent(
+        model=MockedModelProvider(
+            [
+                {"role": "assistant", "content": uses},
+                _assistant_text("Dispatched."),
+                _assistant_text("Results received."),
+            ]
+        ),
+        tools=[slow],
+        background_tasks={"max_concurrency": 1, "timeout": 0.05},
+        callback_handler=None,
+    )
+
+    asyncio.run(agent.invoke_async("Run three slow jobs."))
+
+    tru_peak = peak
+    exp_peak = 1
+    assert tru_peak == exp_peak
+    tru_statuses = [
+        delivery["content"][0]["json"]["status"]
+        for delivery in map(lambda use: _tool_result(agent, use["toolUseId"]), _deliveries(agent.messages))
+    ]
+    exp_statuses = ["failed", "failed", "failed"]
+    assert tru_statuses == exp_statuses
+
+
 @pytest.mark.asyncio
 async def test_load_state_fails_restored_non_terminal_work() -> None:
     created_at = "2026-08-27T12:00:00Z"
