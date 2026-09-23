@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import json
 import logging
 import threading
 from collections.abc import Sequence
@@ -23,6 +24,7 @@ from ..tools.decorator import tool
 from ..tools.executors._executor import _lookup_tool
 from ..types.agent import LocalAgent
 from ..types.content import Messages
+from ..types.session import decode_bytes_values, encode_bytes_values
 from ..types.tools import AgentTool, ToolContext, ToolResult, ToolResultContent, ToolSpec, ToolUse
 from ._errors import BackgroundTaskNotFoundError
 from ._types import BackgroundTask, BackgroundTasksConfig, is_task_status_terminal
@@ -245,7 +247,7 @@ class _BackgroundTasks(Plugin):
         Persisted work cannot resume in a new process, so non-terminal tasks are recorded as
         failed and their interrupts are dropped from the agent's interrupt state.
         """
-        stored: list[BackgroundTask] = self._agent.state.get(_BACKGROUND_TASKS_STATE_KEY) or []
+        stored: list[BackgroundTask] = decode_bytes_values(self._agent.state.get(_BACKGROUND_TASKS_STATE_KEY) or [])
         recovered_interrupt_ids: set[str] = set()
         tasks: dict[str, BackgroundTask] = {}
         for task in stored:
@@ -454,7 +456,7 @@ class _BackgroundTasks(Plugin):
     def _persist_tasks(self) -> None:
         # Snapshot and write under one lock so a concurrent remove cannot be overwritten by a stale snapshot.
         with self._tasks_lock:
-            tasks = list(self._tasks.values())
+            tasks = [_persistable_task(task) for task in self._tasks.values()]
             if tasks:
                 self._agent.state.set(_BACKGROUND_TASKS_STATE_KEY, tasks)
             else:
@@ -513,6 +515,27 @@ def _add_background_selection(tool_spec: ToolSpec) -> ToolSpec | None:
 
 def _tool_error(tool_use: ToolUse, message: str) -> ToolResult:
     return {"toolUseId": tool_use["toolUseId"], "status": "error", "content": [{"text": message}]}
+
+
+def _persistable_task(task: BackgroundTask) -> Any:
+    """Return a JSON-safe copy of a task snapshot for agent state.
+
+    Agent state accepts only JSON, and one rejected snapshot would fail the whole write. Bytes (image,
+    document, or video content) are base64-encoded and decoded again by ``load_state``; any other value
+    JSON cannot hold drops that task's result and interrupt reasons, keeping its status and error.
+    """
+    encoded = encode_bytes_values(task)
+    try:
+        json.dumps(encoded)
+        return encoded
+    except (TypeError, ValueError):
+        logger.warning(
+            "task_id=<%s> | background task is not JSON serializable, persisting its status only", task["task_id"]
+        )
+        persisted = {key: value for key, value in encoded.items() if key not in ("result", "interrupts")}
+        if "interrupts" in encoded:
+            persisted["interrupts"] = [{**interrupt, "reason": None} for interrupt in encoded["interrupts"]]
+        return persisted
 
 
 def _task_result_content(task: BackgroundTask) -> list[ToolResultContent]:

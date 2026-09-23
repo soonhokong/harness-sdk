@@ -731,6 +731,93 @@ def test_next_invocation_returns_after_work_cancelled_by_origin_event_loop_shutd
     assert tru_delivery_count == exp_delivery_count
 
 
+async def _wait_for_listed_status(agent: Agent, status: str) -> None:
+    while True:
+        listing = await _invoke_management_tool(agent, {"mode": "list"})
+        if [task["status"] for task in listing["content"][0]["json"]["tasks"]] == [status]:
+            return
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_restores_completed_work_whose_result_holds_bytes() -> None:
+    # Image bytes are not JSON. The completed task must still reach persisted state, so a snapshot
+    # restores its real result instead of a "cannot resume" failure.
+    released = asyncio.Event()
+    content = [{"image": {"format": "png", "source": {"bytes": b"\x89PNG"}}}]
+
+    @tool(name="shot")
+    async def shot() -> dict[str, Any]:
+        """Take a screenshot."""
+        await released.wait()
+        return {"status": "success", "content": content}
+
+    agent = Agent(
+        model=MockedModelProvider(
+            [
+                _assistant_tool_use("shot", "shot-use", {"_background_execution": True}),
+                _assistant_text("Task admitted."),
+            ]
+        ),
+        tools=[shot],
+        background_tasks={"wait_for_completion": False},
+        callback_handler=None,
+    )
+
+    await agent.invoke_async("Take a screenshot.")
+    released.set()
+    await asyncio.wait_for(_wait_for_listed_status(agent, "completed"), timeout=1)
+
+    tru_persisted_statuses = [task["status"] for task in _persisted_tasks(agent) or []]
+    exp_persisted_statuses = ["completed"]
+    assert tru_persisted_statuses == exp_persisted_statuses
+
+    restored = Agent(
+        model=MockedModelProvider([_assistant_text("Result received.")]),
+        background_tasks={},
+        callback_handler=None,
+    )
+    restored.load_snapshot(agent.take_snapshot(preset="session"))
+    await restored.invoke_async("Continue.")
+
+    delivered = _delivered_result(restored)
+    assert delivered["content"][0]["json"]["status"] == "completed"
+    assert delivered["content"][1:] == content
+
+
+@pytest.mark.asyncio
+async def test_persists_status_of_work_whose_result_is_not_json() -> None:
+    # A result value JSON cannot hold must not stop the task's status from being persisted.
+    released = asyncio.Event()
+
+    @tool(name="work")
+    async def work() -> dict[str, Any]:
+        """Return an opaque handle."""
+        await released.wait()
+        return {"status": "success", "content": [{"json": {"handle": object()}}]}
+
+    agent = Agent(
+        model=MockedModelProvider(
+            [
+                _assistant_tool_use("work", "work-use", {"_background_execution": True}),
+                _assistant_text("Task admitted."),
+            ]
+        ),
+        tools=[work],
+        background_tasks={"wait_for_completion": False},
+        callback_handler=None,
+    )
+
+    await agent.invoke_async("Run work.")
+    released.set()
+    await asyncio.wait_for(_wait_for_listed_status(agent, "completed"), timeout=1)
+
+    [persisted] = _persisted_tasks(agent) or [None]
+    assert persisted is not None
+    assert persisted["status"] == "completed"
+    assert "result" not in persisted
+
+
 @pytest.mark.asyncio
 async def test_load_state_fails_restored_non_terminal_work() -> None:
     created_at = "2026-08-27T12:00:00Z"
