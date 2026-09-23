@@ -9,6 +9,7 @@ import pytest
 
 from strands import Agent, tool
 from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent, BeforeToolCallEvent, BeforeToolsEvent
+from strands.tools.executors import SequentialToolExecutor
 from tests.fixtures.mocked_model_provider import MockedModelProvider
 
 # Default agent response for simple tests
@@ -630,3 +631,100 @@ async def test_cancel_while_tool_runs_does_not_re_execute_the_tool():
     agent._cancel_signal.clear()
     await agent.invoke_async(response)
     assert ran == ["executed"]
+
+
+def _tool_result_ids(agent):
+    return [
+        content["toolResult"]["toolUseId"]
+        for message in agent.messages
+        for content in message["content"]
+        if "toolResult" in content
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_resumed_tool_runs_records_one_tool_result():
+    """A cancel that lands while a resumed tool runs must not make the next resume append its result again."""
+    ran: list[str] = []
+    agent = _approver_agent(ran, cancel_on_first_run=True)
+
+    interrupted = await agent.invoke_async("go")
+    response = [{"interruptResponse": {"interruptId": interrupted.interrupts[0].id, "response": "go"}}]
+
+    cancelled = await agent.invoke_async(response)
+    assert cancelled.stop_reason == "cancelled"
+
+    resumed = await agent.invoke_async(response)
+
+    assert resumed.stop_reason == "end_turn"
+    assert ran == ["executed"]
+    assert _tool_result_ids(agent) == ["tool_1"]
+    assert [message["role"] for message in agent.messages] == ["user", "assistant", "user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_resumed_tool_runs_records_one_tool_result():
+    """A cancel that lands before a resumed tool runs must not leave a cancelled result next to the real one."""
+    ran: list[str] = []
+    agent = _approver_agent(ran)
+
+    interrupted = await agent.invoke_async("go")
+    response = [{"interruptResponse": {"interruptId": interrupted.interrupts[0].id, "response": "go"}}]
+
+    agent.cancel()
+    cancelled = await agent.invoke_async(response)
+    assert cancelled.stop_reason == "cancelled"
+
+    resumed = await agent.invoke_async(response)
+
+    assert resumed.stop_reason == "end_turn"
+    assert ran == ["executed"]
+    assert _tool_result_ids(agent) == ["tool_1"]
+    assert [message["role"] for message in agent.messages] == ["user", "assistant", "user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_sequential_cancel_during_resumed_batch_records_one_result_per_tool():
+    """A cancel that lands between resumed sequential tools must not duplicate the batch's results."""
+    ran: list[str] = []
+
+    @tool(context=True)
+    def first(tool_context) -> str:
+        """Require approval, then cancel the agent."""
+        tool_context.interrupt("approve_first")
+        ran.append("first")
+        tool_context.agent.cancel()
+        return "first done"
+
+    @tool
+    def second() -> str:
+        """Second tool."""
+        ran.append("second")
+        return "second done"
+
+    tool_use_response = {
+        "role": "assistant",
+        "content": [
+            {"toolUse": {"toolUseId": "t1", "name": "first", "input": {}}},
+            {"toolUse": {"toolUseId": "t2", "name": "second", "input": {}}},
+        ],
+    }
+    agent = Agent(
+        model=MockedModelProvider([tool_use_response, DEFAULT_RESPONSE]),
+        tools=[first, second],
+        tool_executor=SequentialToolExecutor(),
+        callback_handler=None,
+    )
+
+    interrupted = await agent.invoke_async("go")
+    response = [{"interruptResponse": {"interruptId": interrupted.interrupts[0].id, "response": "yes"}}]
+
+    cancelled = await agent.invoke_async(response)
+    assert cancelled.stop_reason == "cancelled"
+
+    resumed = await agent.invoke_async(response)
+
+    assert resumed.stop_reason == "end_turn"
+    assert ran == ["first"]
+    assert _tool_result_ids(agent) == ["t1", "t2"]
+    assert [message["role"] for message in agent.messages] == ["user", "assistant", "user", "assistant"]

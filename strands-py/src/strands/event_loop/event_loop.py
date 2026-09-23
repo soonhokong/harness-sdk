@@ -957,15 +957,28 @@ async def _handle_tool_execution(
     elif cancel_message is None:
         agent._interrupt_state.set_pending_tool_results(tool_results)
 
-    await agent._append_messages(tool_result_message)
+    # A cancelled pass that keeps the pending tool execution leaves the batch to the resume that finishes it,
+    # which appends the tool result message once. Appending here too would answer the same tool uses twice.
+    keeps_pending_execution = agent._interrupt_state.pending_tool_execution is not None
+    if not keeps_pending_execution:
+        await agent._append_messages(tool_result_message)
 
-    yield ToolResultMessageEvent(message=tool_result_message)
+        yield ToolResultMessageEvent(message=tool_result_message)
 
     # End the cycle span before yielding the recursive cycle.
     if cycle_span:
         tracer.end_event_loop_cycle_span(span=cycle_span, message=message, tool_result_message=tool_result_message)
 
     agent.event_loop_metrics.end_cycle(cycle_start_time, cycle_trace)
+
+    if keeps_pending_execution:
+        yield EventLoopStopEvent(
+            "cancelled",
+            message,
+            agent.event_loop_metrics,
+            invocation_state["request_state"],
+        )
+        return
 
     # Hook requested halt: exit without calling the model again.
     if after_tools_event.end_turn:
