@@ -74,13 +74,14 @@ class _BeginResult:
       ``waiting_on.register_waiter()`` and then yield the cached result or raise the cached error.
     - ``lock_acquired`` is False: a different invocation owns the lock. Raise
       ``ConcurrencyException``.
-    - Otherwise: proceed with the invocation. Pass ``registered_token`` back to
+    - Otherwise: proceed with the invocation. Pass ``registered`` back to
       ``complete()`` in the success and error paths so waiters get unblocked.
     """
 
     waiting_on: _InflightInvocation | None
     registered_token: Any
     lock_acquired: bool
+    registered: _InflightInvocation | None = None
 
 
 class _ConcurrencyController:
@@ -117,7 +118,7 @@ class _ConcurrencyController:
             See ``_BeginResult``. If ``waiting_on`` is set, the lock is *not* held
             and ``registered_token`` is None.
         """
-        waiting_on, registered_token = self._check_idempotency(idempotency_token)
+        waiting_on, registered = self._check_idempotency(idempotency_token)
         if waiting_on is not None:
             return _BeginResult(waiting_on=waiting_on, registered_token=None, lock_acquired=False)
 
@@ -125,44 +126,43 @@ class _ConcurrencyController:
         if self._mode == ConcurrentInvocationMode.THROW:
             lock_acquired = self._invocation_lock.acquire(blocking=False)
 
-        return _BeginResult(waiting_on=None, registered_token=registered_token, lock_acquired=lock_acquired)
+        registered_token = idempotency_token if registered is not None else None
+        return _BeginResult(
+            waiting_on=None, registered_token=registered_token, lock_acquired=lock_acquired, registered=registered
+        )
 
     def complete(
         self,
-        registered_token: Any,
+        registered: _InflightInvocation | None,
         *,
         result: AgentResult | None = None,
         error: BaseException | None = None,
     ) -> None:
         """Signal waiting duplicates and clear the inflight slot.
 
-        Safe to call multiple times for the same ``registered_token`` (subsequent
-        calls no-op once the slot has been cleared). Safe to call with
-        ``registered_token=None`` (no-op).
+        Only the invocation that ``begin`` registered is settled, and only while it still occupies
+        the slot. Later calls for the same registration are no-ops, and so is a call whose slot
+        now holds a newer registration of an equal token. Safe to call with ``registered=None``.
 
         If both ``result`` and ``error`` are None, waiters receive
         ``IdempotencyAbortedError``.
         """
-        if registered_token is None:
+        if registered is None:
             return
 
         with self._inflight_lock:
-            if self._inflight_token != registered_token:
-                # Another invocation owns the slot (or it was already cleared).
+            if self._inflight is not registered:
                 return
-            inflight = self._inflight
             self._inflight_token = None
             self._inflight = None
 
-        if inflight is None:
-            return
-
         if error is not None:
-            inflight.settle(None, error)
+            registered.settle(None, error)
         elif result is not None:
-            inflight.settle(result, None)
+            registered.settle(result, None)
         else:
-            inflight.settle(None, IdempotencyAbortedError("Primary invocation was aborted before producing a result."))
+            aborted = IdempotencyAbortedError("Primary invocation was aborted before producing a result.")
+            registered.settle(None, aborted)
 
     def try_acquire_lock(self) -> bool:
         """Non-blockingly acquire the invocation lock.
@@ -180,13 +180,15 @@ class _ConcurrencyController:
         if self._invocation_lock.locked():
             self._invocation_lock.release()
 
-    def _check_idempotency(self, idempotency_token: Any) -> tuple[_InflightInvocation | None, Any]:
+    def _check_idempotency(
+        self, idempotency_token: Any
+    ) -> tuple[_InflightInvocation | None, _InflightInvocation | None]:
         """Register a new inflight token, identify a duplicate, or no-op.
 
         Returns:
-            ``(waiting_on, registered_token)``:
+            ``(waiting_on, registered)``:
                 - duplicate: ``(inflight_invocation, None)``
-                - new request: ``(None, idempotency_token)``
+                - new request: ``(None, new_inflight_invocation)``
                 - different token already inflight, no token provided, or
                   UNSAFE_REENTRANT mode: ``(None, None)``
         """
@@ -202,4 +204,4 @@ class _ConcurrencyController:
                 return None, None
             self._inflight = _InflightInvocation()
             self._inflight_token = idempotency_token
-            return None, idempotency_token
+            return None, self._inflight

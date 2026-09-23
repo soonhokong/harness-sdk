@@ -77,7 +77,7 @@ def test_complete_with_result_signals_waiters(controller):
     dup = controller.begin("abc")
 
     mock_result = MagicMock()
-    controller.complete(first.registered_token, result=mock_result)
+    controller.complete(first.registered, result=mock_result)
 
     assert dup.waiting_on.settled
     assert dup.waiting_on.result is mock_result
@@ -89,7 +89,7 @@ def test_complete_with_error_signals_waiters(controller):
     dup = controller.begin("abc")
 
     err = RuntimeError("boom")
-    controller.complete(first.registered_token, error=err)
+    controller.complete(first.registered, error=err)
 
     assert dup.waiting_on.settled
     assert dup.waiting_on.error is err
@@ -100,7 +100,7 @@ def test_complete_with_neither_result_nor_error_sets_aborted(controller):
     first = controller.begin("abc")
     dup = controller.begin("abc")
 
-    controller.complete(first.registered_token)
+    controller.complete(first.registered)
 
     assert dup.waiting_on.settled
     assert isinstance(dup.waiting_on.error, IdempotencyAbortedError)
@@ -129,11 +129,25 @@ def test_complete_is_idempotent_on_double_call(controller):
     dup = controller.begin("abc")
 
     err = RuntimeError("first")
-    controller.complete(first.registered_token, error=err)
+    controller.complete(first.registered, error=err)
     # Second call (e.g. from finally with result=None) must not overwrite.
-    controller.complete(first.registered_token, result=None)
+    controller.complete(first.registered, result=None)
 
     assert dup.waiting_on.error is err  # unchanged
+
+
+def test_stale_complete_does_not_settle_a_newer_registration_of_the_same_token(controller):
+    """A second complete() from a finished primary must not settle a later registration of its token."""
+    first = controller.begin("abc")
+    controller.complete(first.registered, error=RuntimeError("first"))
+    retry = controller.begin("abc")
+    dup = controller.begin("abc")
+
+    controller.complete(first.registered)
+
+    assert dup.waiting_on is retry.registered
+    assert not dup.waiting_on.settled
+    assert controller.begin("abc").waiting_on is retry.registered
 
 
 def test_complete_with_none_token_is_noop(controller):
@@ -148,18 +162,18 @@ def test_complete_with_none_token_is_noop(controller):
 
 def test_complete_after_cleared_is_noop(controller):
     first = controller.begin("abc")
-    controller.complete(first.registered_token, result=MagicMock())
+    controller.complete(first.registered, result=MagicMock())
 
     # Slot is clear; calling complete again on the same token is a safe no-op.
-    controller.complete(first.registered_token, error=RuntimeError("late"))
+    controller.complete(first.registered, error=RuntimeError("late"))
 
 
 def test_release_lock_when_held(controller):
-    controller.begin("abc")
+    first = controller.begin("abc")
     controller.release_lock()
 
     # Lock is now free; a new begin (after completing the inflight) should acquire it.
-    controller.complete("abc", result=MagicMock())
+    controller.complete(first.registered, result=MagicMock())
     result = controller.begin("def")
     assert result.lock_acquired is True
 
@@ -171,7 +185,7 @@ def test_release_lock_when_not_held_is_noop(controller):
 
 def test_completion_clears_slot_so_next_begin_is_fresh(controller):
     first = controller.begin("abc")
-    controller.complete(first.registered_token, result=MagicMock())
+    controller.complete(first.registered, result=MagicMock())
     controller.release_lock()
 
     second = controller.begin("abc")
@@ -195,7 +209,7 @@ def test_unsafe_reentrant_ignores_idempotency_token(reentrant_controller):
 def test_unsafe_reentrant_complete_with_none_token_is_noop(reentrant_controller):
     first = reentrant_controller.begin("abc")
     # registered_token is None in UNSAFE_REENTRANT, so complete is a no-op.
-    reentrant_controller.complete(first.registered_token, result=MagicMock())
+    reentrant_controller.complete(first.registered, result=MagicMock())
 
 
 def test_multiple_duplicates_all_wake_up(controller):
@@ -205,7 +219,7 @@ def test_multiple_duplicates_all_wake_up(controller):
     dup3 = controller.begin("abc")
 
     mock_result = MagicMock()
-    controller.complete(first.registered_token, result=mock_result)
+    controller.complete(first.registered, result=mock_result)
 
     assert dup1.waiting_on.settled
     assert dup2.waiting_on.settled
@@ -238,7 +252,7 @@ def test_lock_acquire_fail_path_cleanup_via_complete(controller):
     second = controller.begin("def")
     assert second.registered_token is None
     # Calling complete with None is a safe no-op:
-    controller.complete(second.registered_token, error=RuntimeError("would-be ConcurrencyException"))
+    controller.complete(second.registered, error=RuntimeError("would-be ConcurrencyException"))
 
 
 def test_concurrent_begin_only_one_primary_others_duplicates(controller):
@@ -283,7 +297,7 @@ async def test_register_waiter_resolves_when_primary_settles_from_another_thread
     assert not wait_future.done()
 
     mock_result = MagicMock()
-    threading.Thread(target=lambda: controller.complete(first.registered_token, result=mock_result)).start()
+    threading.Thread(target=lambda: controller.complete(first.registered, result=mock_result)).start()
 
     await asyncio.wait_for(wait_future, timeout=5)
     assert dup.waiting_on.result is mock_result
@@ -294,7 +308,7 @@ async def test_register_waiter_resolves_immediately_when_already_settled(control
     """If the primary settles before the waiter registers, the awaitable resolves at once."""
     first = controller.begin("abc")
     dup = controller.begin("abc")
-    controller.complete(first.registered_token, result=MagicMock())
+    controller.complete(first.registered, result=MagicMock())
 
     assert dup.waiting_on.settled is True
     await asyncio.wait_for(dup.waiting_on.register_waiter(), timeout=5)
@@ -312,7 +326,7 @@ async def test_cancelling_one_waiter_does_not_strand_others(controller):
     await asyncio.sleep(0)
 
     mock_result = MagicMock()
-    threading.Thread(target=lambda: controller.complete(first.registered_token, result=mock_result)).start()
+    threading.Thread(target=lambda: controller.complete(first.registered, result=mock_result)).start()
 
     await asyncio.wait_for(survivor, timeout=5)
     assert dup.waiting_on.result is mock_result

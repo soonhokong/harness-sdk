@@ -1346,7 +1346,7 @@ class Agent(AgentBase, LocalAgent):
             exc = ConcurrencyException(
                 "Agent is already processing a request. Concurrent invocations are not supported."
             )
-            self._concurrency.complete(begin.registered_token, error=exc)
+            self._concurrency.complete(begin.registered, error=exc)
             raise exc
 
         result: AgentResult | None = None
@@ -1422,7 +1422,7 @@ class Agent(AgentBase, LocalAgent):
 
                 except Exception as e:
                     self._end_agent_trace_span(error=e)
-                    self._concurrency.complete(begin.registered_token, error=e)
+                    self._concurrency.complete(begin.registered, error=e)
                     raise
                 except BaseException as cancellation:
                     # Waiter settlement deferred to the finally block (aborted path) — propagating
@@ -1440,7 +1440,7 @@ class Agent(AgentBase, LocalAgent):
             # Clear cancel signal to allow agent reuse after cancellation
             self._cancel_signal.clear()
 
-            self._concurrency.complete(begin.registered_token, result=result)
+            self._concurrency.complete(begin.registered, result=result)
             if self._concurrency.mode == ConcurrentInvocationMode.THROW:
                 self._concurrency.release_lock()
 
