@@ -150,6 +150,41 @@ describe('tool results in the conversation', () => {
     expect(toolResultIds(agent)).toEqual(['t1'])
   })
 
+  it('does not run a completed tool again when a BeforeToolsEvent interrupt fires on the resume', async () => {
+    const model = new MockMessageModel()
+      .addTurn([
+        { type: 'toolUseBlock', name: 'charge', toolUseId: 't1', input: {} },
+        { type: 'toolUseBlock', name: 'approver', toolUseId: 't2', input: {} },
+      ])
+      .addTurn({ type: 'textBlock', text: 'Done' })
+    const charges: string[] = []
+    let pass = 0
+    const charge = createMockTool('charge', () => {
+      charges.push('charged')
+      return 'charged'
+    })
+    const approver = createMockTool('approver', (context) => {
+      if (pass === 1) context.interrupt({ name: 'approve', reason: 'proceed?' })
+      return 'approved'
+    })
+    const agent = new Agent({ model, tools: [charge, approver], toolExecutor: 'sequential', printer: false })
+    agent.addHook(BeforeToolsEvent, (event) => {
+      pass += 1
+      if (pass === 2) event.interrupt({ name: 'batch_gate', reason: 'confirm the batch' })
+    })
+    const responses = (): InterruptResponseContent[] =>
+      Object.keys(
+        (agent as unknown as { _interruptState: { interrupts: Record<string, unknown> } })._interruptState.interrupts
+      ).map((interruptId) => new InterruptResponseContent({ interruptId, response: 'yes' }))
+
+    expect((await agent.invoke('go')).stopReason).toBe('interrupt')
+    expect((await agent.invoke(responses())).stopReason).toBe('interrupt')
+    expect((await agent.invoke(responses())).stopReason).toBe('endTurn')
+
+    expect(charges).toEqual(['charged'])
+    expect(toolResultIds(agent)).toEqual(['t1', 't2'])
+  })
+
   it('runs the AfterToolCallEvent hooks once when a hook rethrows the tool error', async () => {
     const model = new MockMessageModel()
       .addTurn({ type: 'toolUseBlock', name: 'failing', toolUseId: 't1', input: {} })

@@ -2425,9 +2425,12 @@ export class Agent implements LocalAgent, InvokableAgent {
       // Store pending state before re-throwing so the agent can resume from this point.
       // The error must still propagate to _stream which handles the interrupt stop.
       if (error instanceof InterruptError) {
+        // Keep the results an earlier pass of this batch completed, so the resume does not run those tools again.
         this._interruptState.setPendingToolExecution({
           assistantMessageData: assistantMessage.toJSON(),
-          completedToolResults: {},
+          completedToolResults: Object.fromEntries(
+            Array.from(completedToolResults ?? [], ([toolUseId, result]) => [toolUseId, result.toJSON()])
+          ),
         })
       }
       throw error
