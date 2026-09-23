@@ -135,3 +135,32 @@ async def test_concurrent_executor_reraises_exceptions(
         await alist(stream)
 
     assert tool_results == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_executor_raises_base_exception_from_tool(
+    executor, agent, tool_results, cycle_trace, cycle_span, invocation_state, structured_output_context, alist
+):
+    """A BaseException from a tool body ends the batch, as in the sequential executor.
+
+    It must not end its task silently and let the batch finish with no result for that tool use.
+    """
+
+    @strands.tool(name="awaits_cancelled_future_tool")
+    async def awaits_cancelled_future_tool():
+        future = asyncio.get_running_loop().create_future()
+        future.cancel()
+        await future
+
+    agent.tool_registry.register_tool(awaits_cancelled_future_tool)
+    tool_uses = [
+        {"name": "awaits_cancelled_future_tool", "toolUseId": "1", "input": {}},
+        {"name": "weather_tool", "toolUseId": "2", "input": {}},
+    ]
+
+    stream = executor._execute(
+        agent, tool_uses, tool_results, cycle_trace, cycle_span, invocation_state, structured_output_context
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await alist(stream)

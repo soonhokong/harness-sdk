@@ -3829,3 +3829,45 @@ async def test_agent_span_ends_on_generator_exit():
     assert len(agent_spans) == 1
     assert agent_spans[0].status.status_code == StatusCode.UNSET
     assert agent_spans[0].attributes["strands.cancellation.type"] == "GeneratorExit"
+
+
+def _tool_result_ids_in(message):
+    return [content["toolResult"]["toolUseId"] for content in message["content"] if "toolResult" in content]
+
+
+@pytest.mark.asyncio
+async def test_agent_concurrent_tool_base_exception_does_not_drop_tool_result():
+    """A tool whose body raises a BaseException must not leave its tool use without a result while the agent
+    carries on: the concurrent executor raises it, as the sequential executor does."""
+
+    @strands.tool
+    async def awaits_cancelled_future() -> str:
+        """Await work that someone else cancelled."""
+        future = asyncio.get_running_loop().create_future()
+        future.cancel()
+        await future
+        return "unreachable"
+
+    @strands.tool
+    def ok_tool() -> str:
+        """Return ok."""
+        return "ok"
+
+    tool_use_message = {
+        "role": "assistant",
+        "content": [
+            {"toolUse": {"toolUseId": "t1", "name": "awaits_cancelled_future", "input": {}}},
+            {"toolUse": {"toolUseId": "t2", "name": "ok_tool", "input": {}}},
+        ],
+    }
+    agent = Agent(
+        model=MockedModelProvider([tool_use_message, {"role": "assistant", "content": [{"text": "done"}]}]),
+        tools=[awaits_cancelled_future, ok_tool],
+        callback_handler=None,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await agent.invoke_async("go")
+
+    # No tool-result message that omits t1 was appended.
+    assert all(_tool_result_ids_in(message) in ([], ["t1", "t2"]) for message in agent.messages)

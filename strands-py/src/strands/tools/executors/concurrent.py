@@ -77,7 +77,7 @@ class ConcurrentToolExecutor(ToolExecutor):
                     task_count -= 1
                     continue
 
-                if isinstance(event, Exception):
+                if isinstance(event, BaseException):
                     raise event
 
                 yield event
@@ -129,6 +129,13 @@ class ConcurrentToolExecutor(ToolExecutor):
 
         except Exception as e:
             task_queue.put_nowait((task_id, e))
+
+        except BaseException as error:
+            # A BaseException (e.g. a CancelledError raised by the tool body) must not end the task silently and
+            # leave its tool use without a result: forward it so the executor raises it, as the sequential executor
+            # does. A cancellation from the finally in _execute is forwarded too, but nothing reads the queue then.
+            task_queue.put_nowait((task_id, error))
+            raise
 
         finally:
             task_queue.put_nowait((task_id, stop_event))
